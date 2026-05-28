@@ -43,6 +43,8 @@ export interface SentenceInfo {
   end: number;
   /** Index in the original transcription */
   index: number;
+  /** Semantic tags describing what this sentence is about (e.g., ["app_demo", "tutorial_step"]) */
+  semanticTags?: string[];
 }
 
 export interface TextOverlay {
@@ -75,6 +77,10 @@ export interface LayoutRange {
   textOverlays: TextOverlay[];
   /** Why this layout was chosen (for audit trail) */
   reasoning: string;
+  /** Aggregated semantic tags from all sentences in this range */
+  semanticTags?: string[];
+  /** B-roll content tags relevant to this range (from B-roll analysis) */
+  brollContentTags?: string[];
 
   // ── Pre-computed for renderer ──
 

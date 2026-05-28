@@ -216,6 +216,8 @@ export interface BlueprintSegment {
   broll: BRollCoordinates;
   texts: TextElement[];
   blackRegions: BlackRegion[];
+  /** B-roll content tags from material analysis (what appears in the B-roll during this segment) */
+  brollContentTags?: string[];
 }
 
 export interface ConfidenceScores {

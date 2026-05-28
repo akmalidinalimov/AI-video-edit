@@ -97,6 +97,13 @@ export interface LayoutVariant {
   };
   /** Safe area for any dynamic text overlays */
   textSafeArea: Rect;
+  /**
+   * Content profile: what kinds of content appeared in this layout in the reference.
+   * Derived from semantic_tags of sentences that used this layout.
+   * Used for content-driven layout selection in plan builder.
+   * E.g., ["app_demo", "tutorial_step", "product_feature"]
+   */
+  contentProfile?: string[];
 }
 
 export interface VCSTemplate {

@@ -319,6 +319,8 @@ export async function POST(request: NextRequest) {
           segments: blueprint.reference.segments as unknown as Parameters<typeof generateTemplate>[0]["segments"],
           faceInfo,
           aspectRatio: "9:16",
+          // V2: Pass reference transcription for content profile building
+          referenceTranscription: blueprint.reference.transcription,
         });
 
         sendSSE({ phase: "generating_template", progress: 45, message: `Template generated: ${Object.keys(dynamicTemplate.layouts).length} layouts` });

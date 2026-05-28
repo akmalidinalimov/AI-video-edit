@@ -74,12 +74,20 @@ export interface BlueprintSegment {
     boundingBox: { x: number; y: number; width: number; height: number };
     purpose: string;
   }>;
+  /** B-roll content tags from material analysis */
+  brollContentTags?: string[];
 }
 
 /** Transcription output (from Gemini or other STT) */
 export interface Transcription {
   words: Array<{ word: string; start: number; end: number }>;
-  sentences: Array<{ text: string; start: number; end: number }>;
+  sentences: Array<{
+    text: string;
+    start: number;
+    end: number;
+    /** Semantic tags describing sentence content (e.g., ["app_demo", "tutorial_step"]) */
+    semantic_tags?: string[];
+  }>;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -87,20 +95,65 @@ export interface Transcription {
 // ════════════════════════════════════════════════════════════
 
 /**
+ * Compute semantic affinity between sentence tags and B-roll content tags.
+ *
+ * Returns a score 0-25 based on how many tags overlap between the sentence's
+ * semantic_tags and the segment's brollContentTags. This allows the plan builder
+ * to prefer layouts where the content type matches what appeared in that layout
+ * in the reference video.
+ *
+ * @param sentenceTags - Semantic tags from the A-roll sentence
+ * @param segmentTags - B-roll content tags from the blueprint segment
+ */
+function computeSemanticAffinity(
+  sentenceTags?: string[],
+  segmentTags?: string[]
+): number {
+  if (!sentenceTags?.length || !segmentTags?.length) return 0;
+
+  const sentSet = new Set(sentenceTags.map(t => t.toLowerCase()));
+  const segSet = new Set(segmentTags.map(t => t.toLowerCase()));
+
+  let matches = 0;
+  for (const tag of sentSet) {
+    if (segSet.has(tag)) {
+      matches++;
+    } else {
+      // Partial match: check if any segment tag contains the sentence tag or vice versa
+      for (const segTag of segSet) {
+        if (segTag.includes(tag) || tag.includes(segTag)) {
+          matches += 0.5;
+          break;
+        }
+      }
+    }
+  }
+
+  // Normalize: max 25 points for perfect overlap
+  const maxPossible = Math.max(sentSet.size, segSet.size);
+  return maxPossible > 0 ? Math.min(25, (matches / maxPossible) * 25) : 0;
+}
+
+/**
  * Map a blueprint segment to the BEST MATCHING layout in the VCS template.
  *
  * Instead of hardcoding layout names, this function scores each template layout
  * against the segment's visual properties and picks the best match.
  *
- * Scoring criteria:
- * - Shape match (circle→circle, rectangle→rectangle)
- * - Position match (IoU of bounding boxes)
- * - Header presence match
- * - B-roll coverage match
+ * Scoring criteria (max 125 points):
+ * - Shape match (50 pts): circle→circle, rectangle→rectangle
+ * - Header presence match (20 pts)
+ * - B-roll coverage match (15 pts)
+ * - Position match (15 pts): IoU of bounding boxes
+ * - Semantic affinity bonus (25 pts): sentence tags match B-roll content tags
+ *
+ * The semantic bonus is additive — if semantic data is missing, scoring falls
+ * back to pure geometry (backward compatible).
  */
 function mapBlueprintToTemplateLayout(
   segment: BlueprintSegment,
-  template: VCSTemplate
+  template: VCSTemplate,
+  sentenceTags?: string[]
 ): string {
   const layoutIds = Object.keys(template.layouts);
   if (layoutIds.length === 0) return "unknown";
@@ -151,6 +204,12 @@ function mapBlueprintToTemplateLayout(
       const iou = unionArea > 0 ? overlapArea / unionArea : 0;
       score += iou * 15;
     }
+
+    // Semantic affinity bonus (up to +25 points)
+    // If the sentence talks about the same topic as what appeared in this layout
+    // in the reference video, boost the score
+    const semanticBonus = computeSemanticAffinity(sentenceTags, segment.brollContentTags);
+    score += semanticBonus;
 
     if (score > bestScore) {
       bestScore = score;
@@ -224,6 +283,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     start: s.start,
     end: s.end,
     index: i,
+    semanticTags: s.semantic_tags?.length ? s.semantic_tags : undefined,
   }));
 
   interface SentenceLayout {
@@ -251,7 +311,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
         overlaps.push({
           segment: bpSeg,
           overlap,
-          layoutId: mapBlueprintToTemplateLayout(bpSeg, template),
+          layoutId: mapBlueprintToTemplateLayout(bpSeg, template, sentence.semanticTags),
         });
       }
     }
@@ -277,9 +337,10 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       reasoning = `Matches reference: '${best.layoutId}' (${best.overlap.toFixed(2)}s overlap).`;
     }
 
+    const tagStr = sentence.semanticTags?.length ? ` [tags: ${sentence.semanticTags.join(", ")}]` : "";
     console.log(
       `    S${sentence.index + 1} [${sentence.start.toFixed(2)}-${sentence.end.toFixed(2)}s]: ` +
-      `${best.layoutId} | ${reasoning}`
+      `${best.layoutId} | ${reasoning}${tagStr}`
     );
 
     sentenceLayouts.push({
@@ -300,6 +361,10 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     sentences: SentenceInfo[];
     blueprintSegment: BlueprintSegment;
     reasoning: string;
+    /** Aggregated semantic tags from all sentences in this range */
+    semanticTags: string[];
+    /** B-roll content tags from the blueprint segment */
+    brollContentTags: string[];
   }
 
   const mergedRanges: MergedRange[] = [];
@@ -312,6 +377,12 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       );
       prev.end = sl.sentence.end;
       prev.sentences.push(sl.sentence);
+      // Merge semantic tags (deduplicate)
+      if (sl.sentence.semanticTags) {
+        for (const tag of sl.sentence.semanticTags) {
+          if (!prev.semanticTags.includes(tag)) prev.semanticTags.push(tag);
+        }
+      }
     } else {
       mergedRanges.push({
         layoutId: sl.layoutId,
@@ -320,6 +391,8 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
         sentences: [sl.sentence],
         blueprintSegment: sl.blueprintSegment,
         reasoning: sl.reasoning,
+        semanticTags: sl.sentence.semanticTags ? [...sl.sentence.semanticTags] : [],
+        brollContentTags: sl.blueprintSegment.brollContentTags ? [...sl.blueprintSegment.brollContentTags] : [],
       });
     }
   }
@@ -421,6 +494,8 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       sentences: mr.sentences,
       textOverlays,
       reasoning: mr.reasoning,
+      semanticTags: mr.semanticTags.length > 0 ? mr.semanticTags : undefined,
+      brollContentTags: mr.brollContentTags.length > 0 ? mr.brollContentTags : undefined,
       startFrame,
       endFrame,
       enableExpr,

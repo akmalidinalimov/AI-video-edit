@@ -68,6 +68,8 @@ interface BlueprintSegment {
     boundingBox: BoundingBox;
     purpose: string;
   }>;
+  /** B-roll content tags from material analysis */
+  brollContentTags?: string[];
 }
 
 interface FaceInfo {
@@ -88,6 +90,19 @@ interface TemplateGeneratorInput {
   faceInfo?: FaceInfo;
   /** Optional: aspect ratio label */
   aspectRatio?: "9:16" | "16:9" | "1:1" | "4:5";
+  /**
+   * Optional: reference transcription with semantic_tags per sentence.
+   * Used to build content profiles for each layout variant —
+   * what kinds of content appeared in each layout in the reference.
+   */
+  referenceTranscription?: {
+    sentences: Array<{
+      text: string;
+      start: number;
+      end: number;
+      semantic_tags?: string[];
+    }>;
+  };
 }
 
 // ════════════════════════════════════════════════════════════
@@ -484,6 +499,32 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
           height: canvas.height * 0.6,
         };
 
+    // ── Build content profile from reference transcription ──
+    // Collect semantic_tags from all sentences that overlap segments in this cluster
+    let contentProfile: string[] | undefined;
+    if (input.referenceTranscription?.sentences) {
+      const profileTags = new Set<string>();
+      for (const member of members) {
+        const segStart = member.seg.start;
+        const segEnd = member.seg.end;
+        for (const sent of input.referenceTranscription.sentences) {
+          const overlapStart = Math.max(sent.start, segStart);
+          const overlapEnd = Math.min(sent.end, segEnd);
+          if (overlapEnd > overlapStart && sent.semantic_tags) {
+            for (const tag of sent.semantic_tags) profileTags.add(tag);
+          }
+        }
+        // Also include B-roll content tags from the segment
+        if (member.seg.brollContentTags) {
+          for (const tag of member.seg.brollContentTags) profileTags.add(tag);
+        }
+      }
+      if (profileTags.size > 0) {
+        contentProfile = Array.from(profileTags);
+        console.log(`      Content profile: [${contentProfile.join(", ")}]`);
+      }
+    }
+
     // ── Assemble layout variant ──
     layouts[layoutId] = {
       id: layoutId,
@@ -501,6 +542,7 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
       },
       headerZone,
       textSafeArea,
+      contentProfile,
     };
   }
 

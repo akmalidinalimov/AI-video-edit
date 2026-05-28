@@ -68,8 +68,31 @@ export function assembleBlueprint(input: CrossValidationInput): VisualBlueprint 
   const segmentConsensus = computeSegmentConsensus(assignedCoords, reconciledSegments);
 
   // ── Step 4: Build blueprint segments with validated coordinates ──
+  // Pre-compute B-roll content tags per time range from B-roll material analyses
+  function getBrollContentTagsForRange(start: number, end: number): string[] {
+    const tags = new Set<string>();
+    for (const broll of input.brollAnalyses) {
+      // Collect tags from frame content that overlaps this segment's time range
+      for (const frame of broll.frameContent) {
+        if (frame.timestamp >= start && frame.timestamp <= end) {
+          for (const tag of frame.contentTags) tags.add(tag);
+        }
+      }
+      // Collect tags from internal scenes that overlap
+      for (const scene of broll.internalScenes) {
+        const overlapStart = Math.max(scene.start, start);
+        const overlapEnd = Math.min(scene.end, end);
+        if (overlapEnd > overlapStart) {
+          for (const tag of scene.contentTags) tags.add(tag);
+        }
+      }
+    }
+    return Array.from(tags);
+  }
+
   const blueprintSegments: BlueprintSegment[] = reconciledSegments.map((seg) => {
     const consensus = segmentConsensus.get(seg.id);
+    const brollContentTags = getBrollContentTagsForRange(seg.start, seg.end);
 
     if (!consensus) {
       conflicts.push({
@@ -92,6 +115,7 @@ export function assembleBlueprint(input: CrossValidationInput): VisualBlueprint 
         },
         texts: [],
         blackRegions: [],
+        brollContentTags: brollContentTags.length > 0 ? brollContentTags : undefined,
       };
     }
 
@@ -121,6 +145,7 @@ export function assembleBlueprint(input: CrossValidationInput): VisualBlueprint 
       },
       texts: validated.texts,
       blackRegions: validated.blackRegions,
+      brollContentTags: brollContentTags.length > 0 ? brollContentTags : undefined,
     };
   });
 
