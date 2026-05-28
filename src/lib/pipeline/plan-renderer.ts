@@ -291,6 +291,20 @@ export function buildFilterComplex(
   // ── Step 1: Group ranges by layout ──
   const groups = groupRangesByLayout(plan, template);
 
+  // Log direct replication overrides if present
+  const rangesWithOverrides = plan.layoutRanges.filter(r => r.layoutOverride);
+  if (rangesWithOverrides.length > 0) {
+    console.log(`  [Direct replication] ${rangesWithOverrides.length}/${plan.layoutRanges.length} ranges have coordinate overrides from blueprint`);
+    for (const r of rangesWithOverrides) {
+      const ov = r.layoutOverride!;
+      const parts: string[] = [];
+      if (ov.aroll) parts.push(`aroll=${ov.aroll.shape}(${ov.aroll.region.x},${ov.aroll.region.y},${ov.aroll.region.width}x${ov.aroll.region.height})`);
+      if (ov.broll) parts.push(`broll(${ov.broll.region.x},${ov.broll.region.y},${ov.broll.region.width}x${ov.broll.region.height})`);
+      if (ov.texts?.length) parts.push(`${ov.texts.length} texts`);
+      console.log(`    ${r.id} [${r.layoutId}]: ${parts.join(", ")}`);
+    }
+  }
+
   // ── Step 2: Identify what A-roll branches we need ──
   // Each unique layout with A-roll needs its own crop branch
   const arollBranches: Array<{
@@ -379,8 +393,13 @@ export function buildFilterComplex(
       const offset = range.brollOffset ?? 0;
       const rangeStart = range.timeRange.start;
       const layout = template.layouts[range.layoutId];
-      const brollRegion = layout?.broll?.region ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
-      const isFullCanvas = layout?.broll?.isBackground &&
+      // Direct replication: prefer per-range override coordinates over template
+      const brollRegion = range.layoutOverride?.broll?.region
+        ?? layout?.broll?.region
+        ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      const overrideBg = range.layoutOverride?.broll?.isBackground;
+      const templateBg = layout?.broll?.isBackground;
+      const isFullCanvas = (overrideBg ?? templateBg) &&
         brollRegion.x <= 1 && brollRegion.y <= 1 &&
         brollRegion.width >= canvas.width - 2 &&
         brollRegion.height >= canvas.height - 2;
@@ -402,8 +421,13 @@ export function buildFilterComplex(
     for (let i = 0; i < rangeCount; i++) {
       const range = ranges[i];
       const layout = template.layouts[range.layoutId];
-      const brollRegion = layout?.broll?.region ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
-      const isFullCanvas = layout?.broll?.isBackground &&
+      // Direct replication: prefer per-range override coordinates
+      const brollRegion = range.layoutOverride?.broll?.region
+        ?? layout?.broll?.region
+        ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      const overrideBg = range.layoutOverride?.broll?.isBackground;
+      const templateBg = layout?.broll?.isBackground;
+      const isFullCanvas = (overrideBg ?? templateBg) &&
         brollRegion.x <= 1 && brollRegion.y <= 1 &&
         brollRegion.width >= canvas.width - 2 &&
         brollRegion.height >= canvas.height - 2;

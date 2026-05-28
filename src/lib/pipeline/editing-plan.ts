@@ -86,6 +86,41 @@ export interface LayoutRange {
   /** B-roll source index (for multi-B-roll support; 0-based) */
   brollSourceIndex?: number;
 
+  // ── Direct replication: per-range coordinate overrides ──
+
+  /**
+   * Optional per-range layout override with exact coordinates from the
+   * reference blueprint segment. When present, the renderer uses these
+   * instead of the template's canonical (median-aggregated) coordinates.
+   *
+   * This enables "direct replication" — reproducing the exact layout
+   * of each reference segment rather than using clustered averages.
+   */
+  layoutOverride?: {
+    aroll?: {
+      region: { x: number; y: number; width: number; height: number };
+      shape: "rectangle" | "circle";
+      hasBorder?: boolean;
+      borderColor?: string | null;
+      borderWidth?: number;
+    };
+    broll?: {
+      region: { x: number; y: number; width: number; height: number };
+      isBackground?: boolean;
+    };
+    headerZone?: {
+      region: { x: number; y: number; width: number; height: number };
+    };
+    texts?: Array<{
+      text: string;
+      region: { x: number; y: number; width: number; height: number };
+      fontSize?: number;
+      color?: string;
+      backgroundColor?: string | null;
+      fontWeight?: string;
+    }>;
+  };
+
   // ── Pre-computed for renderer ──
 
   /** Start frame number */

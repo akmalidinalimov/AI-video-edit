@@ -91,6 +91,79 @@ export interface Transcription {
 }
 
 // ════════════════════════════════════════════════════════════
+// DIRECT REPLICATION — BLUEPRINT → LAYOUT OVERRIDE
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Convert a BlueprintSegment's exact bounding boxes into a per-range
+ * layoutOverride. This enables "direct replication" — the renderer
+ * uses exact reference coordinates instead of template medians.
+ *
+ * Returns undefined if the segment lacks usable coordinate data.
+ */
+function buildLayoutOverride(
+  bp: BlueprintSegment
+): LayoutRange["layoutOverride"] | undefined {
+  // Need at minimum the A-roll bounding box
+  if (!bp.aroll?.boundingBox) return undefined;
+
+  const override: NonNullable<LayoutRange["layoutOverride"]> = {};
+
+  // A-roll region from blueprint
+  const arollBB = bp.aroll.boundingBox;
+  override.aroll = {
+    region: { x: arollBB.x, y: arollBB.y, width: arollBB.width, height: arollBB.height },
+    shape: (bp.aroll.shape === "circle" ? "circle" : "rectangle") as "rectangle" | "circle",
+    hasBorder: bp.aroll.hasBorder,
+    borderColor: bp.aroll.borderColor,
+    borderWidth: (bp.aroll as Record<string, unknown>).borderWidth as number | undefined,
+  };
+
+  // B-roll region
+  if (bp.broll?.boundingBox) {
+    const brollBB = bp.broll.boundingBox;
+    override.broll = {
+      region: { x: brollBB.x, y: brollBB.y, width: brollBB.width, height: brollBB.height },
+      // Background when B-roll covers full canvas
+      isBackground: brollBB.x <= 10 && brollBB.y <= 10 &&
+                    brollBB.width >= 1060 && brollBB.height >= 1880,
+    };
+  }
+
+  // Header/black regions
+  if (bp.blackRegions?.length) {
+    const headerRegion = bp.blackRegions.find(r =>
+      r.purpose === "header" || r.boundingBox.y < 400
+    );
+    if (headerRegion) {
+      const hBB = headerRegion.boundingBox;
+      override.headerZone = {
+        region: { x: hBB.x, y: hBB.y, width: hBB.width, height: hBB.height },
+      };
+    }
+  }
+
+  // Text elements
+  if (bp.texts?.length) {
+    override.texts = bp.texts.map(t => ({
+      text: t.text,
+      region: {
+        x: t.boundingBox.x,
+        y: t.boundingBox.y,
+        width: t.boundingBox.width,
+        height: t.boundingBox.height,
+      },
+      fontSize: t.estimatedFontSize,
+      color: t.color,
+      backgroundColor: t.backgroundColor,
+      fontWeight: t.fontWeight,
+    }));
+  }
+
+  return override;
+}
+
+// ════════════════════════════════════════════════════════════
 // LAYOUT MAPPING
 // ════════════════════════════════════════════════════════════
 
@@ -614,6 +687,9 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       }
     }
 
+    // ── Direct replication: carry exact blueprint coordinates ──
+    const layoutOverride = buildLayoutOverride(mr.blueprintSegment);
+
     layoutRanges.push({
       id: `range_${i + 1}`,
       layoutId: mr.layoutId,
@@ -623,6 +699,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       reasoning: mr.reasoning,
       semanticTags: mr.semanticTags.length > 0 ? mr.semanticTags : undefined,
       brollContentTags: mr.brollContentTags.length > 0 ? mr.brollContentTags : undefined,
+      layoutOverride,
       startFrame,
       endFrame,
       enableExpr,
