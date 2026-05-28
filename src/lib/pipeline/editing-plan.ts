@@ -158,6 +158,30 @@ export interface SourceFiles {
   broll: string;
   /** Path to the reference video (for comparison, not used in render) */
   reference?: string;
+  /**
+   * Multiple A-roll videos in upload order. When present, `aroll` is the
+   * first element's path. Each clip is transcribed independently and
+   * concatenated in sequence. Audio maps from the continuous A-roll chain.
+   */
+  arollClips?: Array<{
+    path: string;
+    /** Duration of this clip in seconds */
+    duration: number;
+    /** Cumulative start time in the final timeline */
+    timelineStart: number;
+  }>;
+  /**
+   * Multiple B-roll videos in upload order. When present, `broll` is the
+   * first element's path. The matcher picks the best B-roll source for
+   * each layout range based on content affinity.
+   */
+  brollClips?: Array<{
+    path: string;
+    /** Duration of this clip in seconds */
+    duration: number;
+    /** FFmpeg input index (0-based offset from the first B-roll input) */
+    inputIndex: number;
+  }>;
 }
 
 export interface EditingPlan {

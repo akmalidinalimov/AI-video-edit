@@ -47,6 +47,12 @@ import { REFERENCE_CONSOLIDATED_PROMPT } from "@/lib/gemini/prompts/referenceCon
 import { generateTemplate, extractFaceInfo } from "@/lib/pipeline/template-generator";
 import { buildEditingPlan } from "@/lib/pipeline/plan-builder";
 import { buildRenderArgsWithScript } from "@/lib/pipeline/plan-renderer";
+import {
+  analyzeNarrativeContext,
+  buildArollSummaries,
+  buildBrollSummaries,
+  summariesToBrollScenes,
+} from "@/lib/pipeline/narrative-analyzer";
 
 // Types
 import type {
@@ -113,6 +119,81 @@ async function withRetry<T>(
 }
 
 // ════════════════════════════════════════════════════════════
+// A-ROLL TRANSCRIPTION — Independent from reference
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Transcribe the A-roll video to get accurate word-level timestamps.
+ *
+ * The reference video's transcription has DIFFERENT timing because it was
+ * edited (with B-roll overlays). The A-roll is the raw footage, so we
+ * must transcribe it independently to get correct sentence boundaries
+ * for layout transitions.
+ */
+async function transcribeAroll(
+  videoPath: string
+): Promise<{ words: Array<{ word: string; start: number; end: number }>; sentences: Array<{ text: string; start: number; end: number; semantic_tags?: string[] }> }> {
+  return withCache(videoPath, "aroll_transcription", async () => {
+    console.log("[clone-style] Transcribing A-roll independently for accurate sentence boundaries...");
+
+    const mimeType = videoPath.toLowerCase().endsWith(".mov") ? "video/quicktime" : "video/mp4";
+    const geminiFile = await uploadToGemini(videoPath, mimeType, path.basename(videoPath));
+    const processedFile = await waitForFileProcessing(geminiFile.name);
+
+    const fileData = {
+      fileData: {
+        mimeType: processedFile.mimeType,
+        fileUri: processedFile.uri,
+      },
+    };
+
+    const prompt = `You are a precise speech-to-text transcription engine.
+
+Transcribe this video's audio with EXACT word-level timestamps.
+
+CRITICAL INSTRUCTIONS:
+- Provide timestamps for EVERY word
+- Timestamps must be in SECONDS (decimal, e.g., 2.35)
+- Start time = when the word begins being spoken
+- End time = when the word finishes being spoken
+- Be as precise as possible — even 0.1s matters for video editing
+- Group words into sentences (a sentence ends with a period, question mark, or exclamation mark)
+- For each sentence, assign semantic_tags that describe the content topic (e.g., ["intro", "hook"], ["product_demo"], ["call_to_action"])
+
+Return JSON in this EXACT format:
+{
+  "words": [
+    { "word": "example", "start": 0.0, "end": 0.5 },
+    ...
+  ],
+  "sentences": [
+    { "text": "Full sentence text.", "start": 0.0, "end": 3.5, "semantic_tags": ["intro", "hook"] },
+    ...
+  ]
+}
+
+Return ONLY the JSON, no markdown fences, no explanation.`;
+
+    const result = await withRetry(() =>
+      geminiFlash.generateContent([{ text: prompt }, fileData])
+    );
+    const text = result.response.text();
+    const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    const data = JSON.parse(cleaned);
+
+    console.log(`[clone-style] A-roll transcription: ${data.words?.length ?? 0} words, ${data.sentences?.length ?? 0} sentences`);
+    for (const s of (data.sentences ?? [])) {
+      console.log(`  [${s.start.toFixed(2)}-${s.end.toFixed(2)}s] "${s.text.slice(0, 60)}${s.text.length > 60 ? '...' : ''}"`);
+    }
+
+    return {
+      words: data.words ?? [],
+      sentences: data.sentences ?? [],
+    };
+  });
+}
+
+// ════════════════════════════════════════════════════════════
 // SSE EVENT TYPES
 // ════════════════════════════════════════════════════════════
 
@@ -129,8 +210,22 @@ interface SSEEvent {
 
 interface CloneStyleRequest {
   referenceVideo: string;
-  arollVideo: string;
-  brollVideo: string;
+  /** Single A-roll path (backward compatible) */
+  arollVideo?: string;
+  /** Single B-roll path (backward compatible) */
+  brollVideo?: string;
+  /**
+   * Multiple A-roll videos in upload order.
+   * The first uploaded = first in sequence, second = second, etc.
+   * When provided, takes precedence over arollVideo.
+   */
+  arollVideos?: string[];
+  /**
+   * Multiple B-roll videos in upload order.
+   * Content-aware matching picks the best source for each sentence.
+   * When provided, takes precedence over brollVideo.
+   */
+  brollVideos?: string[];
 }
 
 // ════════════════════════════════════════════════════════════
@@ -162,15 +257,30 @@ export async function POST(request: NextRequest) {
       try {
         const body: CloneStyleRequest = await request.json();
 
-        // ── Validate inputs ──
+        // ── Resolve multi-file inputs (backward compatible) ──
+        // arollVideos[] takes precedence over arollVideo
+        // brollVideos[] takes precedence over brollVideo
+        const arollPaths: string[] = (body.arollVideos?.length ? body.arollVideos : [body.arollVideo ?? ""])
+          .map(resolvePublicPath);
+        const brollPaths: string[] = (body.brollVideos?.length ? body.brollVideos : [body.brollVideo ?? ""])
+          .map(resolvePublicPath);
         const refPath = resolvePublicPath(body.referenceVideo);
-        const arollPath = resolvePublicPath(body.arollVideo);
-        const brollPath = resolvePublicPath(body.brollVideo);
 
+        // Primary paths (first clip = backward compatible)
+        const arollPath = arollPaths[0];
+        const brollPath = brollPaths[0];
+
+        const isMultiAroll = arollPaths.length > 1;
+        const isMultiBroll = brollPaths.length > 1;
+
+        if (isMultiAroll) console.log(`[clone-style] Multi-A-roll mode: ${arollPaths.length} clips`);
+        if (isMultiBroll) console.log(`[clone-style] Multi-B-roll mode: ${brollPaths.length} sources`);
+
+        // ── Validate ALL inputs ──
         for (const [label, filePath] of [
           ["Reference video", refPath],
-          ["A-roll video", arollPath],
-          ["B-roll video", brollPath],
+          ...arollPaths.map((p, i) => [`A-roll video #${i + 1}`, p] as [string, string]),
+          ...brollPaths.map((p, i) => [`B-roll video #${i + 1}`, p] as [string, string]),
         ]) {
           if (!fs.existsSync(filePath)) {
             sendSSE({ phase: "error", progress: -1, message: `${label} not found: ${filePath}` });
@@ -277,10 +387,17 @@ export async function POST(request: NextRequest) {
           // Step 1.4: A-roll material analysis
           const arollAnalysis = await analyzeARollMaterial(arollPath, videoAnalysis.transcription);
 
-          sendSSE({ phase: "analyzing_reference", progress: 24, message: "Analyzing B-roll material..." });
+          sendSSE({ phase: "analyzing_reference", progress: 24, message: `Analyzing B-roll material (${brollPaths.length} source${brollPaths.length > 1 ? 's' : ''})...` });
 
-          // Step 1.5: B-roll analysis
-          const brollAnalysis = await analyzeBRollMaterial(brollPath);
+          // Step 1.5: B-roll analysis — analyze ALL B-roll sources
+          const allBrollAnalyses = [];
+          for (let bi = 0; bi < brollPaths.length; bi++) {
+            const bAnalysis = await analyzeBRollMaterial(brollPaths[bi]);
+            allBrollAnalyses.push(bAnalysis);
+            if (brollPaths.length > 1) {
+              console.log(`[clone-style] B-roll #${bi + 1}: ${bAnalysis.internalScenes.length} scenes, ${bAnalysis.duration.toFixed(1)}s`);
+            }
+          }
 
           sendSSE({ phase: "analyzing_reference", progress: 25, message: "Assembling blueprint..." });
 
@@ -290,7 +407,7 @@ export async function POST(request: NextRequest) {
             videoAnalysis,
             frameCoordinates,
             arollAnalysis,
-            brollAnalyses: [brollAnalysis],
+            brollAnalyses: allBrollAnalyses,
           });
 
           // Cache it
@@ -334,36 +451,155 @@ export async function POST(request: NextRequest) {
         // ════════════════════════════════════════════
         // PHASE 3: Editing Plan
         // ════════════════════════════════════════════
-        sendSSE({ phase: "building_plan", progress: 50, message: "Building editing plan..." });
+        sendSSE({ phase: "building_plan", progress: 48, message: `Transcribing A-roll (${arollPaths.length} clip${arollPaths.length > 1 ? 's' : ''})...` });
 
-        // Get A-roll transcription from blueprint (reference video transcription)
-        const transcription = blueprint.reference.transcription;
+        // ── Multi-A-roll transcription ──
+        // Each clip is transcribed independently. Timestamps are offset by the
+        // cumulative duration of preceding clips so they form a continuous timeline.
+        const allArollTranscriptions: Array<{
+          words: Array<{ word: string; start: number; end: number }>;
+          sentences: Array<{ text: string; start: number; end: number; semantic_tags?: string[] }>;
+        }> = [];
+        const arollClipMeta: Array<{ path: string; duration: number; timelineStart: number }> = [];
+        let cumulativeOffset = 0;
 
-        // V3: Extract B-roll scenes for content-aware matching
-        const brollAnalysis = blueprint.broll?.[0];
-        const brollScenes = brollAnalysis?.internalScenes?.map((scene: { start: number; end: number; description: string; contentTags: string[] }) => ({
-          start: scene.start,
-          end: scene.end,
-          contentTags: scene.contentTags ?? [],
-          description: scene.description,
-        })) ?? [];
-        const brollDuration = brollAnalysis?.duration ?? 0;
+        for (let ai = 0; ai < arollPaths.length; ai++) {
+          const clipPath = arollPaths[ai];
+          const clipTranscription = await transcribeAroll(clipPath);
+
+          // Get clip duration for offset calculation
+          const clipMeta = await getVideoMetadata(clipPath);
+          const clipDuration = clipMeta.duration;
+
+          // Offset timestamps for clips after the first
+          const offsetWords = clipTranscription.words.map((w) => ({
+            ...w,
+            start: w.start + cumulativeOffset,
+            end: w.end + cumulativeOffset,
+          }));
+          const offsetSentences = clipTranscription.sentences.map((s) => ({
+            ...s,
+            start: s.start + cumulativeOffset,
+            end: s.end + cumulativeOffset,
+          }));
+
+          allArollTranscriptions.push({
+            words: offsetWords,
+            sentences: offsetSentences,
+          });
+
+          arollClipMeta.push({
+            path: clipPath,
+            duration: clipDuration,
+            timelineStart: cumulativeOffset,
+          });
+
+          if (arollPaths.length > 1) {
+            console.log(`[clone-style] A-roll #${ai + 1}: offset=${cumulativeOffset.toFixed(2)}s, duration=${clipDuration.toFixed(2)}s, ${offsetSentences.length} sentences`);
+          }
+
+          cumulativeOffset += clipDuration;
+        }
+
+        // Merge all transcriptions into one continuous timeline
+        const mergedTranscription = {
+          words: allArollTranscriptions.flatMap((t) => t.words),
+          sentences: allArollTranscriptions.flatMap((t) => t.sentences),
+        };
+
+        // Save merged transcription for debugging
+        fs.writeFileSync(
+          path.join(tempDir, "aroll-transcription.json"),
+          JSON.stringify({
+            clipCount: arollPaths.length,
+            clips: arollClipMeta,
+            ...mergedTranscription,
+          }, null, 2)
+        );
+
+        sendSSE({ phase: "building_plan", progress: 50, message: "Analyzing content relationships..." });
+
+        // ── Multi-B-roll scene extraction ──
+        // Collect scenes from ALL B-roll sources with source index tracking
+        const allBrollScenes: Array<{ start: number; end: number; contentTags: string[]; description: string; sourceIndex: number }> = [];
+        const brollClipMeta: Array<{ path: string; duration: number; inputIndex: number }> = [];
+
+        const brollData = blueprint.broll ?? [];
+        for (let bi = 0; bi < brollPaths.length; bi++) {
+          const brollAnalysis = brollData[bi];
+          const brollMeta = brollAnalysis
+            ? { duration: brollAnalysis.duration }
+            : await getVideoMetadata(brollPaths[bi]);
+
+          brollClipMeta.push({
+            path: brollPaths[bi],
+            duration: brollMeta.duration,
+            inputIndex: bi,
+          });
+
+          const scenes = brollAnalysis?.internalScenes ?? [];
+          for (const scene of scenes) {
+            allBrollScenes.push({
+              start: (scene as { start: number }).start,
+              end: (scene as { end: number }).end,
+              contentTags: (scene as { contentTags: string[] }).contentTags ?? [],
+              description: (scene as { description: string }).description ?? "",
+              sourceIndex: bi,
+            });
+          }
+        }
+
+        const totalBrollDuration = brollClipMeta.reduce((sum, m) => sum + m.duration, 0);
+
+        // ── Narrative context analysis (deep content awareness) ──
+        // Single Gemini call that understands the overall story and maps
+        // sentences to B-roll scenes with reasoning
+        let narrativeContext;
+        if (allBrollScenes.length > 0 && mergedTranscription.sentences.length > 0) {
+          try {
+            const arollSummaries = buildArollSummaries(allArollTranscriptions);
+            const brollSummaries = buildBrollSummaries(
+              brollData.length > 0
+                ? brollData.map((b: any) => ({ internalScenes: b.internalScenes ?? [] }))
+                : [{ internalScenes: allBrollScenes }]
+            );
+
+            narrativeContext = await analyzeNarrativeContext(
+              arollSummaries.summaries,
+              brollSummaries
+            );
+
+            // Save narrative context for debugging
+            fs.writeFileSync(
+              path.join(tempDir, "narrative-context.json"),
+              JSON.stringify(narrativeContext, null, 2)
+            );
+          } catch (err) {
+            console.error("[clone-style] Narrative analysis failed, falling back to tag matching:", err);
+          }
+        }
+
+        sendSSE({ phase: "building_plan", progress: 53, message: "Building editing plan..." });
 
         const editingPlan = buildEditingPlan({
           blueprintSegments: blueprint.reference.segments as unknown as Parameters<typeof buildEditingPlan>[0]["blueprintSegments"],
           transcription: {
-            words: transcription.words ?? [],
-            sentences: transcription.sentences ?? [],
+            words: mergedTranscription.words ?? [],
+            sentences: mergedTranscription.sentences ?? [],
           },
           templateId: dynamicTemplate.id,
           template: dynamicTemplate,
           sources: {
             aroll: arollPath,
             broll: brollPath,
+            arollClips: arollClipMeta,
+            brollClips: brollClipMeta,
           },
-          // V3: Pass B-roll scene data for content-aware matching
-          brollScenes: brollScenes.length > 0 ? brollScenes : undefined,
-          brollDuration: brollDuration > 0 ? brollDuration : undefined,
+          // Content-aware B-roll matching (all sources unified)
+          brollScenes: allBrollScenes.length > 0 ? allBrollScenes : undefined,
+          brollDuration: totalBrollDuration > 0 ? totalBrollDuration : undefined,
+          // Deep narrative understanding (when available)
+          narrativeContext,
         });
 
         sendSSE({ phase: "building_plan", progress: 55, message: `Plan: ${editingPlan.layoutRanges.length} ranges, ${editingPlan.transitions.length} transitions` });
@@ -381,7 +617,7 @@ export async function POST(request: NextRequest) {
 
         const ffmpegPath = getFFmpegPath();
 
-        // Get A-roll source dimensions for face-centered crop
+        // Get A-roll source dimensions for face-centered crop (use first clip)
         const arollMeta = await getVideoMetadata(arollPath);
 
         const outputFilename = `styleclone-${Date.now()}.mp4`;

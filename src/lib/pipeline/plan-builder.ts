@@ -298,27 +298,29 @@ function mapBlueprintToTemplateLayout(
 // ════════════════════════════════════════════════════════════
 
 /**
- * Match B-roll scenes to layout ranges based on semantic tag affinity.
+ * Match B-roll scenes to layout ranges using the best available strategy.
  *
- * For each layout range, finds the B-roll scene whose content tags best
- * match the range's semantic tags (from sentences) and brollContentTags
- * (from the reference blueprint). Sets `brollOffset` on each range to
- * the matched scene's start time.
+ * Strategy hierarchy (best → fallback):
+ * 1. Narrative context (Gemini-produced relevance map) — understands WHY
+ * 2. Semantic tag affinity — string overlap between tags
+ * 3. Time-proportional mapping — position-based fallback
  *
- * Fallback when no semantic match is found: uses time-proportional
- * mapping (maps the range's relative position in the video to the
- * corresponding position in the B-roll timeline).
+ * Supports multi-B-roll: each scene carries a `sourceIndex` that maps to
+ * the correct FFmpeg input. When using narrative context, the relevance map
+ * already accounts for which source each scene came from.
  *
  * @param layoutRanges - The ranges to assign B-roll offsets to (mutated in place)
- * @param brollScenes - Available B-roll scenes with content tags
+ * @param brollScenes - Available B-roll scenes with content tags (from all sources)
  * @param brollDuration - Total B-roll video duration (for proportional fallback)
  * @param totalDuration - Total output video duration (for proportional fallback)
+ * @param narrativeContext - Optional Gemini-produced narrative understanding
  */
 function matchBrollScenes(
   layoutRanges: LayoutRange[],
   brollScenes: BRollScene[],
   brollDuration: number,
-  totalDuration: number
+  totalDuration: number,
+  narrativeContext?: NarrativeContext
 ): void {
   if (!brollScenes.length) {
     // No scene data: divide B-roll evenly across ranges
@@ -334,38 +336,85 @@ function matchBrollScenes(
   // Track which scenes have been used to encourage variety
   const sceneUsageCount = new Map<number, number>();
 
-  for (const range of layoutRanges) {
-    // Collect all tags from the range (sentences + B-roll content)
-    const rangeTags = [
-      ...(range.semanticTags ?? []),
-      ...(range.brollContentTags ?? []),
-    ];
+  // Build a fast lookup from the narrative context relevance map
+  // sentenceIndex → ranked scene indices with scores
+  const narrativeMap = new Map<number, Array<{ sceneIndex: number; relevanceScore: number; reason: string }>>();
+  if (narrativeContext?.relevanceMap) {
+    for (const entry of narrativeContext.relevanceMap) {
+      narrativeMap.set(entry.sentenceIndex, entry.rankedScenes);
+    }
+    console.log(`    Using narrative context: ${narrativeContext.theme} (${narrativeContext.narrativePhases.length} phases)`);
+  }
 
+  for (const range of layoutRanges) {
     let bestScene = brollScenes[0];
     let bestScore = -1;
     let bestIdx = 0;
+    let matchType = "proportional";
 
-    // Try semantic matching
-    if (rangeTags.length > 0) {
-      for (let i = 0; i < brollScenes.length; i++) {
-        const scene = brollScenes[i];
-        if (!scene.contentTags?.length) continue;
+    // ── Strategy 1: Narrative context (best) ──
+    if (narrativeMap.size > 0 && range.sentences.length > 0) {
+      // Collect relevance scores from all sentences in this range
+      const aggregatedScores = new Map<number, { total: number; reasons: string[] }>();
 
-        let score = computeSemanticAffinity(rangeTags, scene.contentTags);
+      for (const sentence of range.sentences) {
+        const ranked = narrativeMap.get(sentence.index);
+        if (!ranked) continue;
+        for (const entry of ranked) {
+          const existing = aggregatedScores.get(entry.sceneIndex) ?? { total: 0, reasons: [] };
+          existing.total += entry.relevanceScore;
+          if (entry.reason && existing.reasons.length < 2) existing.reasons.push(entry.reason);
+          aggregatedScores.set(entry.sceneIndex, existing);
+        }
+      }
 
-        // Penalize heavily-reused scenes to encourage variety
-        const usage = sceneUsageCount.get(i) ?? 0;
-        score *= Math.max(0.3, 1 - usage * 0.25);
+      // Find best scene from narrative scores
+      for (const [sceneIdx, scores] of aggregatedScores) {
+        if (sceneIdx >= brollScenes.length) continue;
+
+        let score = scores.total;
+        // Penalize heavily-reused scenes
+        const usage = sceneUsageCount.get(sceneIdx) ?? 0;
+        score *= Math.max(0.3, 1 - usage * 0.2);
 
         if (score > bestScore) {
           bestScore = score;
-          bestScene = scene;
-          bestIdx = i;
+          bestScene = brollScenes[sceneIdx];
+          bestIdx = sceneIdx;
+          matchType = "narrative";
         }
       }
     }
 
-    // Fallback: time-proportional mapping when no semantic match (score = 0)
+    // ── Strategy 2: Semantic tag affinity (fallback) ──
+    if (bestScore <= 0) {
+      const rangeTags = [
+        ...(range.semanticTags ?? []),
+        ...(range.brollContentTags ?? []),
+      ];
+
+      if (rangeTags.length > 0) {
+        for (let i = 0; i < brollScenes.length; i++) {
+          const scene = brollScenes[i];
+          if (!scene.contentTags?.length) continue;
+
+          let score = computeSemanticAffinity(rangeTags, scene.contentTags);
+
+          // Penalize heavily-reused scenes to encourage variety
+          const usage = sceneUsageCount.get(i) ?? 0;
+          score *= Math.max(0.3, 1 - usage * 0.25);
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestScene = scene;
+            bestIdx = i;
+            matchType = "semantic";
+          }
+        }
+      }
+    }
+
+    // ── Strategy 3: Time-proportional mapping (last resort) ──
     if (bestScore <= 0) {
       const rangeMidpoint = (range.timeRange.start + range.timeRange.end) / 2;
       const proportionalBrollTime = (rangeMidpoint / totalDuration) * brollDuration;
@@ -381,21 +430,22 @@ function matchBrollScenes(
           bestIdx = i;
         }
       }
+      matchType = "proportional";
     }
 
     range.brollOffset = bestScene.start;
-    range.brollSourceIndex = 0;
+    range.brollSourceIndex = bestScene.sourceIndex ?? 0;
 
     // Track usage
     sceneUsageCount.set(bestIdx, (sceneUsageCount.get(bestIdx) ?? 0) + 1);
 
-    const matchType = bestScore > 0 ? "semantic" : "proportional";
-    const tagInfo = rangeTags.length > 0 ? ` [tags: ${rangeTags.slice(0, 3).join(", ")}]` : "";
+    const tagInfo = (range.semanticTags?.length ?? 0) > 0 ? ` [tags: ${range.semanticTags!.slice(0, 3).join(", ")}]` : "";
     const sceneInfo = bestScene.contentTags?.length
       ? ` → scene [${bestScene.contentTags.slice(0, 3).join(", ")}]`
       : "";
+    const srcInfo = bestScene.sourceIndex !== undefined && bestScene.sourceIndex > 0 ? ` (broll #${bestScene.sourceIndex})` : "";
     console.log(
-      `    ${range.id}: offset=${bestScene.start.toFixed(2)}s (${matchType})${tagInfo}${sceneInfo}`
+      `    ${range.id}: offset=${bestScene.start.toFixed(2)}s (${matchType})${tagInfo}${sceneInfo}${srcInfo}`
     );
   }
 }
@@ -414,6 +464,35 @@ export interface BRollScene {
   contentTags: string[];
   /** Human-readable description */
   description?: string;
+  /** Which B-roll source this scene comes from (0-based, for multi-B-roll) */
+  sourceIndex?: number;
+}
+
+/**
+ * Narrative context map — produced by Gemini to understand the overall
+ * story flow across all A-roll clips and all B-roll sources.
+ *
+ * This enables intelligent matching: instead of just string-overlap on tags,
+ * the system understands WHY a B-roll scene should accompany specific speech.
+ */
+export interface NarrativeContext {
+  /** Overall content theme/topic */
+  theme: string;
+  /** Narrative arc phases detected across all A-roll clips */
+  narrativePhases: Array<{
+    phase: string; // e.g., "hook", "problem", "solution", "demo", "cta"
+    sentenceIndices: number[];
+    description: string;
+  }>;
+  /** Pre-computed relevance map: sentence index → ranked B-roll scene indices */
+  relevanceMap: Array<{
+    sentenceIndex: number;
+    rankedScenes: Array<{
+      sceneIndex: number;
+      relevanceScore: number; // 0-100
+      reason: string;
+    }>;
+  }>;
 }
 
 export interface PlanBuilderInput {
@@ -437,10 +516,17 @@ export interface PlanBuilderInput {
    * Optional: B-roll scene information for content-aware matching.
    * When provided, the plan builder matches B-roll scenes to sentence ranges
    * based on semantic tag affinity and sets brollOffset per LayoutRange.
+   * For multi-B-roll, scenes from all sources are included with sourceIndex set.
    */
   brollScenes?: BRollScene[];
   /** Optional: total B-roll duration (for fallback uniform division) */
   brollDuration?: number;
+  /**
+   * Optional: narrative context from Gemini analysis of ALL clips together.
+   * When provided, the plan builder uses the pre-computed relevance map
+   * for intelligent B-roll matching instead of shallow tag overlap.
+   */
+  narrativeContext?: NarrativeContext;
 }
 
 /**
@@ -719,7 +805,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     const totalDur = layoutRanges[layoutRanges.length - 1]?.timeRange.end ?? 0;
 
     if (brollDuration > 0) {
-      matchBrollScenes(layoutRanges, brollScenes, brollDuration, totalDur);
+      matchBrollScenes(layoutRanges, brollScenes, brollDuration, totalDur, input.narrativeContext);
     } else {
       console.log("    Skipped: no B-roll duration available");
     }

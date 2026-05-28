@@ -288,6 +288,13 @@ export function buildFilterComplex(
   let lastLabel = "bg";
   let stepNum = 1;
 
+  // ── Input index mapping ──
+  // Multi-B-roll: each B-roll is a separate FFmpeg input (0, 1, 2, ...)
+  // A-roll inputs start after all B-roll inputs
+  const brollInputCount = plan.sources.brollClips?.length ?? 1;
+  const arollInputBase = brollInputCount; // First A-roll input index (e.g., 1 for single B-roll)
+  const brollInputBase = 0; // First B-roll input index
+
   // ── Step 1: Group ranges by layout ──
   const groups = groupRangesByLayout(plan, template);
 
@@ -377,14 +384,27 @@ export function buildFilterComplex(
         `setpts=PTS-STARTPTS[bg_base]`
     );
 
-    // 3b. Split B-roll into per-range streams
-    if (rangeCount === 1) {
-      filters.push(`[0:v]setpts=PTS-STARTPTS[br_r0_src]`);
-    } else {
-      const splitLabels = ranges.map((_r, i) => `[br_r${i}_src]`).join("");
-      filters.push(
-        `[0:v]setpts=PTS-STARTPTS,split=${rangeCount}${splitLabels}`
-      );
+    // 3b. Multi-B-roll: group ranges by their brollSourceIndex
+    // Each unique source index maps to a different FFmpeg input
+    const sourceGroups = new Map<number, number[]>(); // sourceIndex → range indices
+    for (let i = 0; i < rangeCount; i++) {
+      const srcIdx = ranges[i].brollSourceIndex ?? 0;
+      const existing = sourceGroups.get(srcIdx) ?? [];
+      existing.push(i);
+      sourceGroups.set(srcIdx, existing);
+    }
+
+    // For each source, split into per-range streams
+    for (const [srcIdx, rangeIndices] of sourceGroups) {
+      const inputIdx = brollInputBase + srcIdx;
+      if (rangeIndices.length === 1) {
+        filters.push(`[${inputIdx}:v]setpts=PTS-STARTPTS[br_r${rangeIndices[0]}_src]`);
+      } else {
+        const splitLabels = rangeIndices.map((ri) => `[br_r${ri}_src]`).join("");
+        filters.push(
+          `[${inputIdx}:v]setpts=PTS-STARTPTS,split=${rangeIndices.length}${splitLabels}`
+        );
+      }
     }
 
     // 3c. For each range: trim to offset, re-timestamp, scale/crop
@@ -450,7 +470,7 @@ export function buildFilterComplex(
   } else if (allBrollIsFullCanvas) {
     // Fast path: single full-canvas B-roll (original behavior, no offsets)
     filters.push(
-      `[0:v]setpts=PTS-STARTPTS,scale=${canvas.width}:${canvas.height}:force_original_aspect_ratio=increase,` +
+      `[${brollInputBase}:v]setpts=PTS-STARTPTS,scale=${canvas.width}:${canvas.height}:force_original_aspect_ratio=increase,` +
         `crop=${canvas.width}:${canvas.height},setsar=1[bg]`
     );
   } else {
@@ -464,14 +484,14 @@ export function buildFilterComplex(
     // 3b. Split B-roll into per-layout branches (or single passthrough)
     if (brollBranches.length === 1) {
       filters.push(
-        `[0:v]setpts=PTS-STARTPTS[${brollBranches[0].label}_src]`
+        `[${brollInputBase}:v]setpts=PTS-STARTPTS[${brollBranches[0].label}_src]`
       );
     } else {
       const splitLabels = brollBranches
         .map((b) => `[${b.label}_src]`)
         .join("");
       filters.push(
-        `[0:v]setpts=PTS-STARTPTS,split=${brollBranches.length}${splitLabels}`
+        `[${brollInputBase}:v]setpts=PTS-STARTPTS,split=${brollBranches.length}${splitLabels}`
       );
     }
 
@@ -507,7 +527,7 @@ export function buildFilterComplex(
     if (arollBranches.length === 1) {
       // Single branch — no split needed
       filters.push(
-        `[1:v]setpts=PTS-STARTPTS[${arollBranches[0].label}_src]`
+        `[${arollInputBase}:v]setpts=PTS-STARTPTS[${arollBranches[0].label}_src]`
       );
     } else {
       // Multiple branches — split A-roll
@@ -515,7 +535,7 @@ export function buildFilterComplex(
         .map((b) => `[${b.label}_src]`)
         .join("");
       filters.push(
-        `[1:v]setpts=PTS-STARTPTS,split=${arollBranches.length}${splitLabels}`
+        `[${arollInputBase}:v]setpts=PTS-STARTPTS,split=${arollBranches.length}${splitLabels}`
       );
     }
 
@@ -558,13 +578,15 @@ export function buildFilterComplex(
           `[${branch.label}_src]scale=${targetW}:-2,setsar=1[${branch.label}]`
         );
       } else {
-        // ── CIRCLE: Zoom in and crop around source center ──
-        // For circle PIP, we need to zoom in so the face is prominent
-        // (reference videos show face filling ~60-70% of the circle).
+        // ── CIRCLE: Crop a region around the speaker, convert to circle ──
         //
-        // Direct calculation: skip computeFaceCrop, use a zoom factor
-        // relative to the base scale. zoomBoost of 2.0x gives a close
-        // match to typical reference circle PIP framing.
+        // Goal: maintain the same distance from camera as the source video.
+        // Shoulders should be visible. The circle crops a square region from
+        // the talking head footage and converts it to a circle mask.
+        //
+        // zoomBoost = 1.3x over base scale: shows face + upper chest/shoulders
+        // at approximately the same framing as the source, just cropped to a
+        // smaller area. This matches typical reference video circle PIP framing.
         const targetW = region.width;
         const targetH = region.height;
 
@@ -572,17 +594,18 @@ export function buildFilterComplex(
         (branch as Record<string, unknown>)._adjustedW = targetW;
         (branch as Record<string, unknown>)._adjustedH = targetH;
 
-        // Crop center: source center horizontally, upper-35% vertically
+        // Crop center: source center horizontally, upper-38% vertically
         // (faces are typically in the upper portion of talking head footage)
         const cropCenterX = Math.round(arollSourceDimensions.width / 2);
-        const cropCenterY = Math.round(arollSourceDimensions.height * 0.35);
+        const cropCenterY = Math.round(arollSourceDimensions.height * 0.38);
 
-        // Zoom: base scale * boost to make face prominent in circle
+        // Zoom: base scale * modest boost — keep natural camera distance
+        // 1.3x shows face + shoulders; 2.0x was too zoomed in
         const baseScale = Math.max(
           targetW / arollSourceDimensions.width,
           targetH / arollSourceDimensions.height
         );
-        const zoomBoost = 2.0;
+        const zoomBoost = 1.3;
         const scale = baseScale * zoomBoost;
 
         let scaledW = Math.round(arollSourceDimensions.width * scale);
@@ -836,24 +859,38 @@ export function buildRenderArgs(input: RenderInput): RenderOutput {
     brollIsBackground: g.layout.broll.isBackground,
   }));
 
+  // ── Build FFmpeg input args ──
+  // Multi-B-roll: each B-roll source is a separate input.
+  // Input order: [B-roll 0, B-roll 1, ..., A-roll 0, A-roll 1, ...]
+  // The filter references [0:v] for first B-roll, [N:v] for first A-roll, etc.
+  const inputArgs: string[] = [];
+
+  // B-roll inputs
+  const brollClips = plan.sources.brollClips ?? [{ path: plan.sources.broll, duration: 0, inputIndex: 0 }];
+  for (const clip of brollClips) {
+    inputArgs.push("-i", clip.path);
+  }
+
+  // A-roll inputs
+  const arollClips = plan.sources.arollClips ?? [{ path: plan.sources.aroll, duration: 0, timelineStart: 0 }];
+  const arollInputBaseIdx = brollClips.length; // First A-roll input index
+  for (const clip of arollClips) {
+    inputArgs.push("-i", clip.path);
+  }
+
   // Build FFmpeg args
   const ffmpegArgs = [
     "-y",
-    // Input 0: B-roll (continuous)
-    "-i",
-    plan.sources.broll,
-    // Input 1: A-roll (continuous, also audio source)
-    "-i",
-    plan.sources.aroll,
+    ...inputArgs,
     // Filter complex (inline, not script file)
     "-filter_complex",
     filterComplex,
     // Map video from filter output
     "-map",
     "[out]",
-    // Map audio from A-roll (input 1) — continuous, never cut
+    // Map audio from first A-roll input — continuous, never cut
     "-map",
-    "1:a",
+    `${arollInputBaseIdx}:a`,
     // Duration
     "-t",
     plan.totalDuration.toFixed(3),

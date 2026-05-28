@@ -41,6 +41,7 @@ export type CacheCategory =
   | "video_analysis"
   | "screenshot_coordinates"
   | "aroll_material"
+  | "aroll_transcription"
   | "broll_material"
   | "visual_blueprint"
   | "style_fingerprint";
