@@ -195,7 +195,7 @@ export async function analyzeBRollMaterial(
  * Group consecutive frames with similar content tags into scenes.
  */
 function groupIntoScenes(
-  frameContent: { timestamp: number; contentTags: string[]; topicMatch: string }[]
+  frameContent: { timestamp: number; contentTags: string[]; visibleText?: string[]; uiElements?: string[]; topicMatch: string }[]
 ): BRollInternalScene[] {
   if (frameContent.length === 0) return [];
 
@@ -205,6 +205,8 @@ function groupIntoScenes(
     end: frameContent[0].timestamp,
     description: frameContent[0].topicMatch,
     contentTags: [...frameContent[0].contentTags],
+    visibleText: [...(frameContent[0].visibleText ?? [])],
+    uiElements: [...(frameContent[0].uiElements ?? [])],
   };
 
   for (let i = 1; i < frameContent.length; i++) {
@@ -229,6 +231,18 @@ function groupIntoScenes(
           currentScene.contentTags.push(tag);
         }
       }
+      // Accumulate OCR text (deduplicated)
+      for (const text of (frame.visibleText ?? [])) {
+        if (!currentScene.visibleText!.includes(text)) {
+          currentScene.visibleText!.push(text);
+        }
+      }
+      // Accumulate UI elements (deduplicated)
+      for (const ui of (frame.uiElements ?? [])) {
+        if (!currentScene.uiElements!.includes(ui)) {
+          currentScene.uiElements!.push(ui);
+        }
+      }
     } else {
       // New scene — save current and start new
       if (currentScene.end - currentScene.start >= 0.5) {
@@ -239,6 +253,8 @@ function groupIntoScenes(
         end: frame.timestamp,
         description: frame.topicMatch,
         contentTags: [...frame.contentTags],
+        visibleText: [...(frame.visibleText ?? [])],
+        uiElements: [...(frame.uiElements ?? [])],
       };
     }
   }

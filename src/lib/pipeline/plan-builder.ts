@@ -168,43 +168,81 @@ function buildLayoutOverride(
 // ════════════════════════════════════════════════════════════
 
 /**
- * Compute semantic affinity between sentence tags and B-roll content tags.
+ * Compute semantic affinity between sentence content and B-roll scene content.
  *
- * Returns a score 0-25 based on how many tags overlap between the sentence's
- * semantic_tags and the segment's brollContentTags. This allows the plan builder
- * to prefer layouts where the content type matches what appeared in that layout
- * in the reference video.
+ * V2 ENHANCED: Now uses 3 matching signals:
+ * 1. Tag overlap (original) — semantic_tags vs contentTags
+ * 2. OCR keyword match (#1 + #4) — speech keywords vs B-roll visible text
+ * 3. Substring search — sentence words in B-roll descriptions
+ *
+ * Returns a score 0-50 (increased from 0-25 to reflect additional signals).
  *
  * @param sentenceTags - Semantic tags from the A-roll sentence
  * @param segmentTags - B-roll content tags from the blueprint segment
+ * @param ocrText - OCR text extracted from B-roll scene frames (#1)
+ * @param speechKeywords - Specific keywords from the sentence (#4)
  */
 function computeSemanticAffinity(
   sentenceTags?: string[],
-  segmentTags?: string[]
+  segmentTags?: string[],
+  ocrText?: string[],
+  speechKeywords?: string[]
 ): number {
-  if (!sentenceTags?.length || !segmentTags?.length) return 0;
+  let score = 0;
 
-  const sentSet = new Set(sentenceTags.map(t => t.toLowerCase()));
-  const segSet = new Set(segmentTags.map(t => t.toLowerCase()));
+  // ── Signal 1: Tag overlap (original, max 25 pts) ──
+  if (sentenceTags?.length && segmentTags?.length) {
+    const sentSet = new Set(sentenceTags.map(t => t.toLowerCase()));
+    const segSet = new Set(segmentTags.map(t => t.toLowerCase()));
 
-  let matches = 0;
-  for (const tag of sentSet) {
-    if (segSet.has(tag)) {
-      matches++;
-    } else {
-      // Partial match: check if any segment tag contains the sentence tag or vice versa
-      for (const segTag of segSet) {
-        if (segTag.includes(tag) || tag.includes(segTag)) {
-          matches += 0.5;
-          break;
+    let tagMatches = 0;
+    for (const tag of sentSet) {
+      if (segSet.has(tag)) {
+        tagMatches++;
+      } else {
+        for (const segTag of segSet) {
+          if (segTag.includes(tag) || tag.includes(segTag)) {
+            tagMatches += 0.5;
+            break;
+          }
         }
       }
     }
+
+    const maxPossible = Math.max(sentSet.size, segSet.size);
+    score += maxPossible > 0 ? Math.min(25, (tagMatches / maxPossible) * 25) : 0;
   }
 
-  // Normalize: max 25 points for perfect overlap
-  const maxPossible = Math.max(sentSet.size, segSet.size);
-  return maxPossible > 0 ? Math.min(25, (matches / maxPossible) * 25) : 0;
+  // ── Signal 2: OCR keyword match (#1 + #4, max 25 pts) ──
+  // This is the HIGHEST precision signal: if the B-roll screen literally
+  // shows text that matches what the speaker is saying, it's almost
+  // certainly the right B-roll.
+  if (ocrText?.length && speechKeywords?.length) {
+    const ocrLower = ocrText.map(t => t.toLowerCase()).join(" ");
+    let kwMatches = 0;
+
+    for (const kw of speechKeywords) {
+      const kwLower = kw.toLowerCase();
+      if (kwLower.length < 2) continue; // skip single chars
+
+      if (ocrLower.includes(kwLower)) {
+        kwMatches += 2; // Exact substring match = strong signal
+      } else {
+        // Try individual words from multi-word keywords
+        const words = kwLower.split(/\s+/);
+        for (const word of words) {
+          if (word.length >= 3 && ocrLower.includes(word)) {
+            kwMatches += 1;
+            break;
+          }
+        }
+      }
+    }
+
+    score += Math.min(25, kwMatches * 5);
+  }
+
+  return Math.min(50, score);
 }
 
 /**
@@ -386,19 +424,34 @@ function matchBrollScenes(
       }
     }
 
-    // ── Strategy 2: Semantic tag affinity (fallback) ──
+    // ── Strategy 2: Enhanced semantic + OCR affinity (fallback) ──
     if (bestScore <= 0) {
       const rangeTags = [
         ...(range.semanticTags ?? []),
         ...(range.brollContentTags ?? []),
       ];
 
-      if (rangeTags.length > 0) {
+      // Collect speech keywords from sentences in this range
+      const rangeKeywords: string[] = [];
+      for (const sentence of range.sentences) {
+        // Extract meaningful words from sentence text (> 3 chars)
+        const words = sentence.text.split(/\s+/).filter(w => w.length > 3);
+        rangeKeywords.push(...words);
+      }
+
+      if (rangeTags.length > 0 || rangeKeywords.length > 0) {
         for (let i = 0; i < brollScenes.length; i++) {
           const scene = brollScenes[i];
-          if (!scene.contentTags?.length) continue;
 
-          let score = computeSemanticAffinity(rangeTags, scene.contentTags);
+          // Enhanced: pass OCR text and keywords for multi-signal matching
+          let score = computeSemanticAffinity(
+            rangeTags.length > 0 ? rangeTags : undefined,
+            scene.contentTags?.length ? scene.contentTags : undefined,
+            scene.visibleText,       // #1: OCR text from B-roll
+            rangeKeywords.length > 0 ? rangeKeywords : undefined  // #4: speech keywords
+          );
+
+          if (score <= 0) continue;
 
           // Penalize heavily-reused scenes to encourage variety
           const usage = sceneUsageCount.get(i) ?? 0;
@@ -408,7 +461,7 @@ function matchBrollScenes(
             bestScore = score;
             bestScene = scene;
             bestIdx = i;
-            matchType = "semantic";
+            matchType = score >= 20 ? "keyword+ocr" : "semantic";
           }
         }
       }
@@ -466,6 +519,10 @@ export interface BRollScene {
   description?: string;
   /** Which B-roll source this scene comes from (0-based, for multi-B-roll) */
   sourceIndex?: number;
+  /** OCR text extracted from frames in this scene (#1: B-roll OCR) */
+  visibleText?: string[];
+  /** UI elements detected in this scene */
+  uiElements?: string[];
 }
 
 /**

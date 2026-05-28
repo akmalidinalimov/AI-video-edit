@@ -193,6 +193,12 @@ export interface BRollInternalScene {
   end: number;
   description: string;
   contentTags: string[];
+  /** OCR text extracted from frames in this scene (for keyword matching) */
+  visibleText?: string[];
+  /** UI elements detected in this scene */
+  uiElements?: string[];
+  /** Narrative phase this scene belongs to (hook, demo, cta, etc.) */
+  narrativePhase?: string;
 }
 
 export interface BRollMaterialAnalysis {

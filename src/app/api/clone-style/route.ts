@@ -49,6 +49,8 @@ import { buildEditingPlan } from "@/lib/pipeline/plan-builder";
 import { buildRenderArgsWithScript } from "@/lib/pipeline/plan-renderer";
 import {
   analyzeNarrativeContext,
+  extractSpeechKeywords,
+  verifyMatches,
   buildArollSummaries,
   buildBrollSummaries,
   summariesToBrollScenes,
@@ -521,7 +523,7 @@ export async function POST(request: NextRequest) {
 
         // ── Multi-B-roll scene extraction ──
         // Collect scenes from ALL B-roll sources with source index tracking
-        const allBrollScenes: Array<{ start: number; end: number; contentTags: string[]; description: string; sourceIndex: number }> = [];
+        const allBrollScenes: Array<{ start: number; end: number; contentTags: string[]; description: string; sourceIndex: number; visibleText?: string[]; uiElements?: string[] }> = [];
         const brollClipMeta: Array<{ path: string; duration: number; inputIndex: number }> = [];
 
         const brollData = blueprint.broll ?? [];
@@ -545,28 +547,54 @@ export async function POST(request: NextRequest) {
               contentTags: (scene as { contentTags: string[] }).contentTags ?? [],
               description: (scene as { description: string }).description ?? "",
               sourceIndex: bi,
+              visibleText: (scene as any).visibleText ?? [],
+              uiElements: (scene as any).uiElements ?? [],
             });
           }
         }
 
         const totalBrollDuration = brollClipMeta.reduce((sum, m) => sum + m.duration, 0);
 
-        // ── Narrative context analysis (deep content awareness) ──
-        // Single Gemini call that understands the overall story and maps
-        // sentences to B-roll scenes with reasoning
+        // ── Deep content awareness pipeline ──
+        // 3 Gemini calls: (1) keyword extraction, (2) narrative analysis, (3) verification
         let narrativeContext;
+        let speechKeywords;
+
         if (allBrollScenes.length > 0 && mergedTranscription.sentences.length > 0) {
           try {
+            // #4: Extract specific keywords from each sentence
+            sendSSE({ phase: "building_plan", progress: 51, message: "Extracting speech keywords..." });
+            speechKeywords = await extractSpeechKeywords(
+              mergedTranscription.sentences.map((s, i) => ({ index: i, text: s.text }))
+            );
+            fs.writeFileSync(
+              path.join(tempDir, "speech-keywords.json"),
+              JSON.stringify(speechKeywords, null, 2)
+            );
+
+            // #1 + #5: Full narrative analysis with OCR text and phase alignment
+            sendSSE({ phase: "building_plan", progress: 52, message: "Analyzing narrative context..." });
             const arollSummaries = buildArollSummaries(allArollTranscriptions);
             const brollSummaries = buildBrollSummaries(
               brollData.length > 0
-                ? brollData.map((b: any) => ({ internalScenes: b.internalScenes ?? [] }))
-                : [{ internalScenes: allBrollScenes }]
+                ? brollData.map((b: any) => ({
+                    internalScenes: (b.internalScenes ?? []).map((s: any) => ({
+                      ...s,
+                      visibleText: s.visibleText ?? [],
+                      uiElements: s.uiElements ?? [],
+                    })),
+                  }))
+                : [{ internalScenes: allBrollScenes.map(s => ({
+                    ...s,
+                    visibleText: (s as any).visibleText ?? [],
+                    uiElements: (s as any).uiElements ?? [],
+                  })) }]
             );
 
             narrativeContext = await analyzeNarrativeContext(
               arollSummaries.summaries,
-              brollSummaries
+              brollSummaries,
+              speechKeywords
             );
 
             // Save narrative context for debugging
@@ -575,7 +603,7 @@ export async function POST(request: NextRequest) {
               JSON.stringify(narrativeContext, null, 2)
             );
           } catch (err) {
-            console.error("[clone-style] Narrative analysis failed, falling back to tag matching:", err);
+            console.error("[clone-style] Content awareness pipeline failed, falling back to tag matching:", err);
           }
         }
 
@@ -603,6 +631,47 @@ export async function POST(request: NextRequest) {
         });
 
         sendSSE({ phase: "building_plan", progress: 55, message: `Plan: ${editingPlan.layoutRanges.length} ranges, ${editingPlan.transitions.length} transitions` });
+
+        // ── #3: Cross-modal verification ──
+        // Verify that each (sentence, B-roll) match actually makes sense.
+        // Bad matches (score < 70) are logged for future re-matching.
+        if (narrativeContext && allBrollScenes.length > 0) {
+          try {
+            sendSSE({ phase: "building_plan", progress: 57, message: "Verifying content matches..." });
+            const matchPairs = editingPlan.layoutRanges.map((range) => {
+              const sceneIdx = range.brollSourceIndex ?? 0;
+              const scene = allBrollScenes[sceneIdx] ?? allBrollScenes[0];
+              return {
+                sentenceIndex: range.sentences[0]?.index ?? 0,
+                sentenceText: range.sentences.map(s => s.text).join(" "),
+                sceneIndex: sceneIdx,
+                sceneDescription: scene?.description ?? "",
+                sceneTags: scene?.contentTags ?? [],
+                sceneOcrText: (scene as any)?.visibleText,
+              };
+            });
+
+            const verification = await verifyMatches(matchPairs);
+
+            // Save verification results for debugging
+            fs.writeFileSync(
+              path.join(tempDir, "match-verification.json"),
+              JSON.stringify(verification, null, 2)
+            );
+
+            const badMatches = verification.pairs.filter(p => !p.isGoodMatch);
+            if (badMatches.length > 0) {
+              console.log(`[clone-style] ${badMatches.length} weak B-roll matches detected (overall: ${verification.overallScore}%)`);
+              for (const bad of badMatches) {
+                console.log(`  S${bad.sentenceIndex}→B${bad.sceneIndex}: ${bad.score}% — ${bad.suggestion ?? "no suggestion"}`);
+              }
+            } else {
+              console.log(`[clone-style] All B-roll matches verified (${verification.overallScore}%)`);
+            }
+          } catch (err) {
+            console.error("[clone-style] Match verification failed (non-blocking):", err);
+          }
+        }
 
         // Save plan for debugging
         fs.writeFileSync(
