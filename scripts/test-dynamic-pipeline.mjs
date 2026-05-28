@@ -149,13 +149,43 @@ function generateTemplate(canvas, segments, faceInfo) {
   }
   console.log(`  Found ${clusters.size} unique layout type(s)`);
 
+  // Step 2b: Merge clusters with the same layout ID (V4 fix)
+  const mergedClusters = new Map();
+  for (const [_key, members] of clusters.entries()) {
+    const layoutId = members[0].id;
+    const existing = mergedClusters.get(layoutId);
+    if (existing) {
+      existing.push(...members);
+    } else {
+      mergedClusters.set(layoutId, [...members]);
+    }
+  }
+  if (mergedClusters.size < clusters.size) {
+    console.log(`  Merged ${clusters.size} clusters → ${mergedClusters.size} unique layout(s)`);
+  }
+
   // Step 3: Build layouts
   console.log("\n  Step 3: Building layout variants...");
   const layouts = {};
 
-  for (const [key, members] of clusters.entries()) {
-    const rep = members[0];
-    const layoutId = rep.id;
+  for (const [layoutId, members] of mergedClusters.entries()) {
+    // Use dominant sub-group's fingerprint (V4: most segments)
+    const subGroups = new Map();
+    for (const m of members) {
+      const k = fingerprintKey(m.fp);
+      const existing = subGroups.get(k) || [];
+      existing.push(m);
+      subGroups.set(k, existing);
+    }
+    let dominantGroup = members;
+    let maxCount = 0;
+    for (const [_k, group] of subGroups.entries()) {
+      if (group.length > maxCount) {
+        maxCount = group.length;
+        dominantGroup = group;
+      }
+    }
+    const rep = dominantGroup[0];
     const fp = rep.fp;
     console.log(`\n    Layout: "${layoutId}" (${members.length} segment(s))`);
 
@@ -185,12 +215,21 @@ function generateTemplate(canvas, segments, faceInfo) {
       }
     }
 
-    // B-roll
-    const brollBoxes = members.filter(m => m.seg.broll?.boundingBox).map(m => m.seg.broll.boundingBox);
-    const brollRegion = brollBoxes.length > 0
-      ? aggregateBoundingBoxes(brollBoxes)
-      : { x: 0, y: 0, width: canvas.width, height: canvas.height };
-    console.log(`      B-roll region: (${brollRegion.x}, ${brollRegion.y}) ${brollRegion.width}×${brollRegion.height} (bg=${fp.brollFullCanvas})`);
+    // B-roll (V4 fix: force full-canvas for PIP layouts)
+    const isPipLayout = fp.arollShape === "circle" &&
+      fp.arollPosition !== "full" && fp.arollPosition !== "center";
+    let brollRegion, brollIsBackground;
+    if (isPipLayout) {
+      brollRegion = { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      brollIsBackground = true;
+    } else {
+      const brollBoxes = members.filter(m => m.seg.broll?.boundingBox).map(m => m.seg.broll.boundingBox);
+      brollRegion = brollBoxes.length > 0
+        ? aggregateBoundingBoxes(brollBoxes)
+        : { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      brollIsBackground = fp.brollFullCanvas;
+    }
+    console.log(`      B-roll region: (${brollRegion.x}, ${brollRegion.y}) ${brollRegion.width}×${brollRegion.height} (bg=${brollIsBackground})`);
 
     // Header
     let headerZone = null;
@@ -257,7 +296,7 @@ function generateTemplate(canvas, segments, faceInfo) {
     layouts[layoutId] = {
       id: layoutId,
       aroll: { region: arollRegion, shape: arollShape, circle: circleDef, border: borderDef, faceCropCenter },
-      broll: { region: brollRegion, isBackground: fp.brollFullCanvas },
+      broll: { region: brollRegion, isBackground: brollIsBackground },
       headerZone,
     };
   }

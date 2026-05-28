@@ -318,14 +318,49 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
 
   console.log(`  Found ${clusters.size} unique layout type(s)`);
 
+  // ── Step 2b: Merge clusters with the same layout ID ──
+  // Multiple clusters can produce the same ID (e.g., three clusters all named
+  // "circle_pip_top_right" because they differ only in arollSizeClass).
+  // Merge them: the dominant cluster (most segments) provides canonical coords.
+  const mergedClusters = new Map<string, Array<typeof classified[0]>>();
+  for (const [_key, members] of Array.from(clusters.entries())) {
+    const layoutId = members[0].id;
+    const existing = mergedClusters.get(layoutId);
+    if (existing) {
+      existing.push(...members);
+    } else {
+      mergedClusters.set(layoutId, [...members]);
+    }
+  }
+  if (mergedClusters.size < clusters.size) {
+    console.log(`  Merged ${clusters.size} clusters → ${mergedClusters.size} unique layout(s)`);
+  }
+
   // ── Step 3: Build layout variants ──
   console.log("\n  Step 3: Building layout variants...");
 
   const layouts: Record<string, LayoutVariant> = {};
 
-  for (const [key, members] of Array.from(clusters.entries())) {
-    const representative = members[0];
-    const layoutId = representative.id;
+  for (const [layoutId, members] of Array.from(mergedClusters.entries())) {
+    // Use the fingerprint from the cluster with the most segments (dominant)
+    // Group members back by original fingerprint key to find dominant
+    const subGroups = new Map<string, typeof members>();
+    for (const m of members) {
+      const k = fingerprintKey(m.fp);
+      const existing = subGroups.get(k) || [];
+      existing.push(m);
+      subGroups.set(k, existing);
+    }
+    // Dominant = largest sub-group
+    let dominantGroup = members;
+    let maxCount = 0;
+    for (const [_k, group] of Array.from(subGroups.entries())) {
+      if (group.length > maxCount) {
+        maxCount = group.length;
+        dominantGroup = group;
+      }
+    }
+    const representative = dominantGroup[0];
     const fp = representative.fp;
 
     console.log(`\n    Layout: "${layoutId}" (${members.length} segment(s))`);
@@ -380,13 +415,29 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
     }
 
     // ── B-roll region ──
-    const brollBoxes = members
-      .filter(m => m.seg.broll?.boundingBox)
-      .map(m => m.seg.broll!.boundingBox);
-    const brollRegion = brollBoxes.length > 0
-      ? aggregateBoundingBoxes(brollBoxes)
-      : { x: 0, y: 0, width: canvas.width, height: canvas.height };
-    const brollIsBackground = fp.brollFullCanvas;
+    // For circle PIP layouts, B-roll is ALWAYS full-canvas background.
+    // The Gemini analysis sometimes reports a smaller B-roll region because
+    // it measures visible area excluding the circle overlay. Force full canvas.
+    const isPipLayout = fp.arollShape === "circle" &&
+      fp.arollPosition !== "full" &&
+      fp.arollPosition !== "center";
+
+    let brollRegion: Rect;
+    let brollIsBackground: boolean;
+
+    if (isPipLayout) {
+      // Force full-canvas background for PIP layouts
+      brollRegion = { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      brollIsBackground = true;
+    } else {
+      const brollBoxes = members
+        .filter(m => m.seg.broll?.boundingBox)
+        .map(m => m.seg.broll!.boundingBox);
+      brollRegion = brollBoxes.length > 0
+        ? aggregateBoundingBoxes(brollBoxes)
+        : { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      brollIsBackground = fp.brollFullCanvas;
+    }
     console.log(`      B-roll region: (${brollRegion.x}, ${brollRegion.y}) ${brollRegion.width}×${brollRegion.height} (bg=${brollIsBackground})`);
 
     // ── Header zone ──
