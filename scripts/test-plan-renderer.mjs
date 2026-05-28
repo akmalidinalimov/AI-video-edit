@@ -94,14 +94,24 @@ const DEFAULT_FONTS = {
   headline: "C\\:/Windows/Fonts/GeorgiaPro-BoldItalic.ttf",
 };
 
-function computeFaceCrop(targetW, targetH, faceX, faceY, srcW, srcH) {
+function computeFaceCrop(targetW, targetH, faceCenterX, faceCenterY, srcW, srcH) {
+  // V5.1: Face-centering scale — ensure enough room to center the face
   const scaleW = targetW / srcW;
   const scaleH = targetH / srcH;
-  const scale = Math.max(scaleW, scaleH);
-  const scaledW = Math.round(srcW * scale) + (Math.round(srcW * scale) % 2);
-  const scaledH = Math.round(srcH * scale) + (Math.round(srcH * scale) % 2);
-  const fx = Math.round(faceX * scale);
-  const fy = Math.round(faceY * scale);
+  const baseScale = Math.max(scaleW, scaleH);
+
+  const fxFrac = Math.max(0.1, Math.min(0.9, faceCenterX / srcW));
+  const fyFrac = Math.max(0.1, Math.min(0.9, faceCenterY / srcH));
+
+  const neededScaleX = targetW / (2 * Math.min(fxFrac, 1 - fxFrac) * srcW);
+  const neededScaleY = targetH / (2 * Math.min(fyFrac, 1 - fyFrac) * srcH);
+
+  const faceScale = Math.min(baseScale * 2, Math.max(baseScale, neededScaleX, neededScaleY));
+
+  const scaledW = Math.round(srcW * faceScale) + (Math.round(srcW * faceScale) % 2);
+  const scaledH = Math.round(srcH * faceScale) + (Math.round(srcH * faceScale) % 2);
+  const fx = Math.round(faceCenterX * faceScale);
+  const fy = Math.round(faceCenterY * faceScale);
   const cropX = Math.max(0, Math.min(fx - Math.round(targetW / 2), scaledW - targetW));
   const cropY = Math.max(0, Math.min(fy - Math.round(targetH / 2), scaledH - targetH));
   return { scaledW, scaledH, cropX, cropY };
@@ -225,24 +235,41 @@ function buildFilterComplexFromPlan(plan, template, arollSrcW, arollSrcH) {
   }
 
   // A-roll crop per branch
+  // V5.1: Preserve A-roll source aspect ratio for full-width rectangles
   for (const branch of arollBranches) {
     const region = branch.layout.aroll.region;
     const faceCenter = branch.layout.aroll.faceCropCenter || { x: arollSrcW / 2, y: arollSrcH / 2 };
-    const fc = computeFaceCrop(region.width, region.height, faceCenter.x, faceCenter.y, arollSrcW, arollSrcH);
+
+    let targetW = region.width;
+    let targetH = region.height;
+
+    // For full-width rectangle A-roll, preserve source aspect ratio
+    if (branch.shape === "rectangle" && region.width >= canvas.width * 0.9) {
+      const sourceAspect = arollSrcW / arollSrcH;
+      const aspectCorrectH = Math.round(region.width / sourceAspect);
+      targetH = aspectCorrectH + (aspectCorrectH % 2);
+      console.log(`  [V5.1] Full-width rect: region.height ${region.height} → ${targetH} (preserving ${arollSrcW}×${arollSrcH} aspect)`);
+    }
+
+    // Store adjusted dimensions for overlay positioning
+    branch._adjustedW = targetW;
+    branch._adjustedH = targetH;
+
+    const fc = computeFaceCrop(targetW, targetH, faceCenter.x, faceCenter.y, arollSrcW, arollSrcH);
 
     if (branch.shape === "circle") {
-      const radius = Math.min(region.width, region.height) / 2;
-      const cx = region.width / 2;
-      const cy = region.height / 2;
+      const radius = Math.min(targetW, targetH) / 2;
+      const cx = targetW / 2;
+      const cy = targetH / 2;
       filters.push(
-        `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${region.width}:${region.height}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}_raw]`
+        `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${targetW}:${targetH}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}_raw]`
       );
       filters.push(
         `[${branch.label}_raw]format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(pow(X-${cx},2)+pow(Y-${cy},2),pow(${radius},2)),255,0)'[${branch.label}]`
       );
     } else {
       filters.push(
-        `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${region.width}:${region.height}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}]`
+        `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${targetW}:${targetH}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}]`
       );
     }
   }
@@ -272,7 +299,7 @@ function buildFilterComplexFromPlan(plan, template, arollSrcW, arollSrcH) {
       stepNum++;
     }
 
-    // Rectangle A-roll
+    // Rectangle A-roll (V5.1: keep original Y, taller crop extends downward)
     if (layout.aroll.shape === "rectangle" && layout.aroll.region.width > 0) {
       const region = layout.aroll.region;
       filters.push(

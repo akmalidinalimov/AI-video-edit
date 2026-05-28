@@ -403,6 +403,18 @@ export async function POST(request: NextRequest) {
         // Write filter script to file
         fs.writeFileSync(filterScriptPath, renderOutput.filterComplex);
 
+        // Debug logging: key render parameters
+        console.log("[clone-style] ═══ RENDER DEBUG ═══");
+        console.log("[clone-style] A-roll source:", JSON.stringify(arollMeta.resolution));
+        console.log("[clone-style] Face info:", JSON.stringify(faceInfo));
+        for (const [layoutId, layout] of Object.entries(dynamicTemplate.layouts)) {
+          console.log(`[clone-style] Layout "${layoutId}" faceCropCenter:`, JSON.stringify((layout as any).aroll?.faceCropCenter));
+          console.log(`[clone-style] Layout "${layoutId}" aroll region:`, JSON.stringify((layout as any).aroll?.region));
+          console.log(`[clone-style] Layout "${layoutId}" aroll shape:`, (layout as any).aroll?.shape);
+        }
+        console.log("[clone-style] Filter (first 500 chars):", renderOutput.filterComplex.slice(0, 500));
+        console.log("[clone-style] ═══ END DEBUG ═══");
+
         sendSSE({ phase: "rendering", progress: 65, message: "Rendering video (single-pass FFmpeg)..." });
 
         // Spawn FFmpeg
@@ -445,7 +457,13 @@ export async function POST(request: NextRequest) {
 
           proc.on("close", (code) => {
             clearTimeout(timer);
-            // Clean up filter script
+            // Preserve filter script for debugging (copy to sp-temp)
+            try {
+              const debugFilterPath = path.join(tempDir, "last-render-filter.txt");
+              fs.copyFileSync(filterScriptPath, debugFilterPath);
+              console.log(`[clone-style] Filter saved to: ${debugFilterPath}`);
+            } catch { /* ignore copy failure */ }
+            // Clean up original filter script
             try { fs.unlinkSync(filterScriptPath); } catch { /* ignore */ }
 
             if (code === 0 && fs.existsSync(outputPath)) {

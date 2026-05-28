@@ -156,6 +156,15 @@ function groupRangesByLayout(
  *
  * Given the target crop size and the face center in the source video,
  * computes scale + crop parameters that keep the face centered.
+ *
+ * V5.1 FIX (Issue 3): The original algorithm used `Math.max(scaleW, scaleH)`
+ * which could leave zero margin on one axis. For example, scaling a 1920×1080
+ * source to fit a 460×460 circle target: scaleH = 0.426, scaledH = 460 — no
+ * vertical room to center a face that's above the midpoint.
+ *
+ * The fix: compute the minimum scale needed so that the face can be centered
+ * in BOTH dimensions of the crop. This means the scaled image must be large
+ * enough that shifting the crop window to center the face stays within bounds.
  */
 function computeFaceCrop(
   targetW: number,
@@ -165,19 +174,44 @@ function computeFaceCrop(
   sourceW: number,
   sourceH: number
 ): { scaledW: number; scaledH: number; cropX: number; cropY: number } {
+  // Base scale: ensure source covers target area
   const scaleW = targetW / sourceW;
   const scaleH = targetH / sourceH;
-  const scale = Math.max(scaleW, scaleH);
+  const baseScale = Math.max(scaleW, scaleH);
 
-  const scaledW = Math.round(sourceW * scale);
-  const scaledH = Math.round(sourceH * scale);
+  // Face-centering scale: ensure enough room to center the face.
+  // After scaling, the face must be at least targetW/2 from both edges
+  // horizontally, and targetH/2 from both edges vertically.
+  const faceFractionX = faceCenterX / sourceW; // 0..1, where face is horizontally
+  const faceFractionY = faceCenterY / sourceH; // 0..1, where face is vertically
+
+  // Minimum scaled width so face can be centered: face needs targetW/2 pixels
+  // on each side. If face is at fraction f, scaled width must be at least
+  // targetW / (2 * min(f, 1-f)) — but clamp to avoid infinite when face is at edge.
+  let faceScale = baseScale;
+
+  const fxClamped = Math.max(0.1, Math.min(0.9, faceFractionX));
+  const fyClamped = Math.max(0.1, Math.min(0.9, faceFractionY));
+
+  const neededScaleForX = targetW / (2 * Math.min(fxClamped, 1 - fxClamped) * sourceW);
+  const neededScaleForY = targetH / (2 * Math.min(fyClamped, 1 - fyClamped) * sourceH);
+
+  // Use the maximum of base scale and face-centering requirements,
+  // but cap at 2x the base scale to avoid excessive zoom
+  faceScale = Math.min(
+    baseScale * 2,
+    Math.max(baseScale, neededScaleForX, neededScaleForY)
+  );
+
+  const scaledW = Math.round(sourceW * faceScale);
+  const scaledH = Math.round(sourceH * faceScale);
 
   // Ensure even dimensions for FFmpeg
   const evenScaledW = scaledW + (scaledW % 2);
   const evenScaledH = scaledH + (scaledH % 2);
 
-  const faceX = Math.round(faceCenterX * scale);
-  const faceY = Math.round(faceCenterY * scale);
+  const faceX = Math.round(faceCenterX * faceScale);
+  const faceY = Math.round(faceCenterY * faceScale);
 
   const cropX = Math.max(
     0,
@@ -461,44 +495,103 @@ export function buildFilterComplex(
       );
     }
 
-    // Crop each branch to its target dimensions (face-centered)
+    // ── V6: Direct replication — use source video as-is ──
+    //
+    // RECTANGLE: Scale to fit width, NO crop. Show the full original frame.
+    //   The speaker was framed well in their source video — zooming/cropping
+    //   based on (potentially inaccurate) face detection makes things worse.
+    //   Just: scale=targetW:-2 (auto-height preserving aspect ratio).
+    //
+    // CIRCLE: Scale down and crop a square around the source center.
+    //   Use center-of-source (sourceW/2, sourceH/2) as the default crop point
+    //   instead of Gemini face detection which may be inaccurate.
+    //   computeFaceCrop() is still used for circles since we MUST extract
+    //   a small region from a wide frame — but with a reliable center point.
+
     for (const branch of arollBranches) {
       const region = branch.layout.aroll.region;
-      const faceCenter = branch.layout.aroll.faceCropCenter ?? {
-        x: arollSourceDimensions.width / 2,
-        y: arollSourceDimensions.height / 2,
-      };
 
-      const fc = computeFaceCrop(
-        region.width,
-        region.height,
-        faceCenter.x,
-        faceCenter.y,
-        arollSourceDimensions.width,
-        arollSourceDimensions.height
-      );
+      if (branch.shape === "rectangle") {
+        // ── RECTANGLE: Scale to fit, NO crop ──
+        // scale=targetW:-2 auto-computes height preserving aspect ratio
+        // and ensures even dimensions. Full source frame is shown.
+        const targetW = region.width;
+        // Compute actual height for overlay positioning
+        const sourceAspect = arollSourceDimensions.width / arollSourceDimensions.height;
+        let scaledH = Math.round(targetW / sourceAspect);
+        scaledH = scaledH + (scaledH % 2); // ensure even
 
-      if (branch.shape === "circle") {
-        // Circle: crop to square, then apply circular mask
-        const radius = Math.min(region.width, region.height) / 2;
-        const cx = region.width / 2;
-        const cy = region.height / 2;
+        // Store adjusted dimensions on the branch for overlay positioning
+        (branch as Record<string, unknown>)._adjustedW = targetW;
+        (branch as Record<string, unknown>)._adjustedH = scaledH;
+
+        console.log(
+          `  [V6] Rectangle A-roll: scale-to-fit (NO crop). ` +
+          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → ${targetW}×${scaledH}`
+        );
 
         filters.push(
-          `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},` +
-            `crop=${region.width}:${region.height}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}_raw]`
+          `[${branch.label}_src]scale=${targetW}:-2,setsar=1[${branch.label}]`
+        );
+      } else {
+        // ── CIRCLE: Zoom in and crop around source center ──
+        // For circle PIP, we need to zoom in so the face is prominent
+        // (reference videos show face filling ~60-70% of the circle).
+        //
+        // Direct calculation: skip computeFaceCrop, use a zoom factor
+        // relative to the base scale. zoomBoost of 2.0x gives a close
+        // match to typical reference circle PIP framing.
+        const targetW = region.width;
+        const targetH = region.height;
+
+        // Store dimensions for overlay positioning
+        (branch as Record<string, unknown>)._adjustedW = targetW;
+        (branch as Record<string, unknown>)._adjustedH = targetH;
+
+        // Crop center: source center horizontally, upper-35% vertically
+        // (faces are typically in the upper portion of talking head footage)
+        const cropCenterX = Math.round(arollSourceDimensions.width / 2);
+        const cropCenterY = Math.round(arollSourceDimensions.height * 0.35);
+
+        // Zoom: base scale * boost to make face prominent in circle
+        const baseScale = Math.max(
+          targetW / arollSourceDimensions.width,
+          targetH / arollSourceDimensions.height
+        );
+        const zoomBoost = 2.0;
+        const scale = baseScale * zoomBoost;
+
+        let scaledW = Math.round(arollSourceDimensions.width * scale);
+        let scaledH = Math.round(arollSourceDimensions.height * scale);
+        scaledW += scaledW % 2; // ensure even
+        scaledH += scaledH % 2;
+
+        // Center crop on the face position
+        const faceX = Math.round(cropCenterX * scale);
+        const faceY = Math.round(cropCenterY * scale);
+        const cropX = Math.max(0, Math.min(faceX - Math.round(targetW / 2), scaledW - targetW));
+        const cropY = Math.max(0, Math.min(faceY - Math.round(targetH / 2), scaledH - targetH));
+
+        console.log(
+          `  [V6] Circle A-roll: zoom=${scale.toFixed(3)} (base=${baseScale.toFixed(3)} * ${zoomBoost}x). ` +
+          `Center: (${cropCenterX},${cropCenterY}). Scale: ${scaledW}x${scaledH}. ` +
+          `Crop: ${targetW}x${targetH} at (${cropX},${cropY}). ` +
+          `Face in crop: (${faceX - cropX},${faceY - cropY})`
+        );
+
+        // Circle: crop to square, then apply circular mask
+        const radius = Math.min(targetW, targetH) / 2;
+        const cx = targetW / 2;
+        const cy = targetH / 2;
+
+        filters.push(
+          `[${branch.label}_src]scale=${scaledW}:${scaledH},` +
+            `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}_raw]`
         );
         filters.push(
           `[${branch.label}_raw]format=yuva420p,` +
             `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':` +
             `a='if(lt(pow(X-${cx},2)+pow(Y-${cy},2),pow(${radius},2)),255,0)'` +
-            `[${branch.label}]`
-        );
-      } else {
-        // Rectangle: just scale and crop
-        filters.push(
-          `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},` +
-            `crop=${region.width}:${region.height}:${fc.cropX}:${fc.cropY},setsar=1` +
             `[${branch.label}]`
         );
       }
@@ -551,8 +644,16 @@ export function buildFilterComplex(
       const region = layout.aroll.region;
       const branchLabel = `aroll_${group.layoutId}`;
 
+      // V5.1: When A-roll aspect ratio was preserved, the crop may be taller
+      // than the template region. Keep the original overlay Y (don't center)
+      // so the A-roll extends downward into the B-roll area rather than
+      // moving up into the header zone. This preserves the reference's
+      // header-to-aroll spatial relationship while showing more of the
+      // talking head's native aspect ratio.
+      const overlayY = region.y;
+
       filters.push(
-        `[${lastLabel}][${branchLabel}]overlay=${region.x}:${region.y}:` +
+        `[${lastLabel}][${branchLabel}]overlay=${region.x}:${overlayY}:` +
           `enable=${enableStr}[step${stepNum}]`
       );
       lastLabel = `step${stepNum}`;
