@@ -221,8 +221,127 @@ function mapBlueprintToTemplateLayout(
 }
 
 // ════════════════════════════════════════════════════════════
+// B-ROLL SCENE MATCHING
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Match B-roll scenes to layout ranges based on semantic tag affinity.
+ *
+ * For each layout range, finds the B-roll scene whose content tags best
+ * match the range's semantic tags (from sentences) and brollContentTags
+ * (from the reference blueprint). Sets `brollOffset` on each range to
+ * the matched scene's start time.
+ *
+ * Fallback when no semantic match is found: uses time-proportional
+ * mapping (maps the range's relative position in the video to the
+ * corresponding position in the B-roll timeline).
+ *
+ * @param layoutRanges - The ranges to assign B-roll offsets to (mutated in place)
+ * @param brollScenes - Available B-roll scenes with content tags
+ * @param brollDuration - Total B-roll video duration (for proportional fallback)
+ * @param totalDuration - Total output video duration (for proportional fallback)
+ */
+function matchBrollScenes(
+  layoutRanges: LayoutRange[],
+  brollScenes: BRollScene[],
+  brollDuration: number,
+  totalDuration: number
+): void {
+  if (!brollScenes.length) {
+    // No scene data: divide B-roll evenly across ranges
+    console.log("    No B-roll scenes available — using uniform division");
+    const segDuration = brollDuration / layoutRanges.length;
+    for (let i = 0; i < layoutRanges.length; i++) {
+      layoutRanges[i].brollOffset = Math.min(i * segDuration, brollDuration - 0.1);
+      layoutRanges[i].brollSourceIndex = 0;
+    }
+    return;
+  }
+
+  // Track which scenes have been used to encourage variety
+  const sceneUsageCount = new Map<number, number>();
+
+  for (const range of layoutRanges) {
+    // Collect all tags from the range (sentences + B-roll content)
+    const rangeTags = [
+      ...(range.semanticTags ?? []),
+      ...(range.brollContentTags ?? []),
+    ];
+
+    let bestScene = brollScenes[0];
+    let bestScore = -1;
+    let bestIdx = 0;
+
+    // Try semantic matching
+    if (rangeTags.length > 0) {
+      for (let i = 0; i < brollScenes.length; i++) {
+        const scene = brollScenes[i];
+        if (!scene.contentTags?.length) continue;
+
+        let score = computeSemanticAffinity(rangeTags, scene.contentTags);
+
+        // Penalize heavily-reused scenes to encourage variety
+        const usage = sceneUsageCount.get(i) ?? 0;
+        score *= Math.max(0.3, 1 - usage * 0.25);
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestScene = scene;
+          bestIdx = i;
+        }
+      }
+    }
+
+    // Fallback: time-proportional mapping when no semantic match (score = 0)
+    if (bestScore <= 0) {
+      const rangeMidpoint = (range.timeRange.start + range.timeRange.end) / 2;
+      const proportionalBrollTime = (rangeMidpoint / totalDuration) * brollDuration;
+
+      let closestDist = Infinity;
+      for (let i = 0; i < brollScenes.length; i++) {
+        const scene = brollScenes[i];
+        const sceneMid = (scene.start + scene.end) / 2;
+        const dist = Math.abs(sceneMid - proportionalBrollTime);
+        if (dist < closestDist) {
+          closestDist = dist;
+          bestScene = scene;
+          bestIdx = i;
+        }
+      }
+    }
+
+    range.brollOffset = bestScene.start;
+    range.brollSourceIndex = 0;
+
+    // Track usage
+    sceneUsageCount.set(bestIdx, (sceneUsageCount.get(bestIdx) ?? 0) + 1);
+
+    const matchType = bestScore > 0 ? "semantic" : "proportional";
+    const tagInfo = rangeTags.length > 0 ? ` [tags: ${rangeTags.slice(0, 3).join(", ")}]` : "";
+    const sceneInfo = bestScene.contentTags?.length
+      ? ` → scene [${bestScene.contentTags.slice(0, 3).join(", ")}]`
+      : "";
+    console.log(
+      `    ${range.id}: offset=${bestScene.start.toFixed(2)}s (${matchType})${tagInfo}${sceneInfo}`
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 // PLAN BUILDER
 // ════════════════════════════════════════════════════════════
+
+/** B-roll scene info for content matching */
+export interface BRollScene {
+  /** Start time in the B-roll video */
+  start: number;
+  /** End time in the B-roll video */
+  end: number;
+  /** Content tags describing what appears in this scene */
+  contentTags: string[];
+  /** Human-readable description */
+  description?: string;
+}
 
 export interface PlanBuilderInput {
   /** Visual blueprint segments from reference analysis */
@@ -241,6 +360,14 @@ export interface PlanBuilderInput {
    * The template is auto-registered so downstream code can still use templateId.
    */
   template?: VCSTemplate;
+  /**
+   * Optional: B-roll scene information for content-aware matching.
+   * When provided, the plan builder matches B-roll scenes to sentence ranges
+   * based on semantic tag affinity and sets brollOffset per LayoutRange.
+   */
+  brollScenes?: BRollScene[];
+  /** Optional: total B-roll duration (for fallback uniform division) */
+  brollDuration?: number;
 }
 
 /**
@@ -505,6 +632,20 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
       `    range_${i + 1}: ${mr.start.toFixed(2)}-${mr.end.toFixed(2)}s | ` +
       `${mr.layoutId} | enable='${enableExpr}'`
     );
+  }
+
+  // ── Step 6b: Match B-roll scenes (content-aware offsets) ──
+  if (input.brollScenes?.length || input.brollDuration) {
+    console.log("\n  Step 5b: Matching B-roll scenes to layout ranges...");
+    const brollScenes = input.brollScenes ?? [];
+    const brollDuration = input.brollDuration ?? 0;
+    const totalDur = layoutRanges[layoutRanges.length - 1]?.timeRange.end ?? 0;
+
+    if (brollDuration > 0) {
+      matchBrollScenes(layoutRanges, brollScenes, brollDuration, totalDur);
+    } else {
+      console.log("    Skipped: no B-roll duration available");
+    }
   }
 
   // ── Step 7: Build transition points ──

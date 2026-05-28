@@ -81,6 +81,10 @@ export interface LayoutRange {
   semanticTags?: string[];
   /** B-roll content tags relevant to this range (from B-roll analysis) */
   brollContentTags?: string[];
+  /** B-roll seek offset: which time in the B-roll video to show during this range */
+  brollOffset?: number;
+  /** B-roll source index (for multi-B-roll support; 0-based) */
+  brollSourceIndex?: number;
 
   // ── Pre-computed for renderer ──
 

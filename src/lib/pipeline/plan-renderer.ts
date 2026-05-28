@@ -284,7 +284,10 @@ export function buildFilterComplex(
   }
 
   // ── Step 3: B-roll preparation ──
-  // Identify per-layout B-roll branches
+  // Check if any range has per-range B-roll offsets (V3 content matching)
+  const hasBrollOffsets = plan.layoutRanges.some(r => r.brollOffset !== undefined);
+
+  // Identify per-layout B-roll branches (needed for both offset and non-offset paths)
   const brollBranches = groups.map((g) => ({
     layoutId: g.layoutId,
     region: g.layout.broll.region,
@@ -304,8 +307,90 @@ export function buildFilterComplex(
       b.region.height >= canvas.height - 2
   );
 
-  if (allBrollIsFullCanvas) {
-    // Fast path: single full-canvas B-roll (original behavior)
+  if (hasBrollOffsets) {
+    // ── Per-range B-roll offsets (V3: content-matched B-roll) ──
+    //
+    // Each layout range shows a different portion of the B-roll video,
+    // determined by the brollOffset field. We:
+    // 1. Create a black base canvas
+    // 2. Split B-roll into N streams (one per range)
+    // 3. Each stream: trim to offset → reset PTS → scale/crop
+    // 4. Overlay each at the right time using per-range enable
+    //
+    // The result is [bg], which downstream overlays (header, A-roll, text)
+    // use unchanged — only B-roll sourcing changes.
+
+    const ranges = plan.layoutRanges;
+    const rangeCount = ranges.length;
+
+    // 3a. Black canvas base
+    filters.push(
+      `color=black:s=${canvas.width}x${canvas.height}:r=${fps}:d=999,` +
+        `setpts=PTS-STARTPTS[bg_base]`
+    );
+
+    // 3b. Split B-roll into per-range streams
+    if (rangeCount === 1) {
+      filters.push(`[0:v]setpts=PTS-STARTPTS[br_r0_src]`);
+    } else {
+      const splitLabels = ranges.map((_r, i) => `[br_r${i}_src]`).join("");
+      filters.push(
+        `[0:v]setpts=PTS-STARTPTS,split=${rangeCount}${splitLabels}`
+      );
+    }
+
+    // 3c. For each range: trim to offset, re-timestamp, scale/crop
+    for (let i = 0; i < rangeCount; i++) {
+      const range = ranges[i];
+      const offset = range.brollOffset ?? 0;
+      const rangeStart = range.timeRange.start;
+      const layout = template.layouts[range.layoutId];
+      const brollRegion = layout?.broll?.region ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      const isFullCanvas = layout?.broll?.isBackground &&
+        brollRegion.x <= 1 && brollRegion.y <= 1 &&
+        brollRegion.width >= canvas.width - 2 &&
+        brollRegion.height >= canvas.height - 2;
+
+      const targetW = isFullCanvas ? canvas.width : brollRegion.width;
+      const targetH = isFullCanvas ? canvas.height : brollRegion.height;
+
+      // trim → setpts (shift to range position) → scale/crop
+      filters.push(
+        `[br_r${i}_src]trim=start=${offset.toFixed(4)},` +
+          `setpts=PTS-STARTPTS+${rangeStart.toFixed(4)},` +
+          `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,` +
+          `crop=${targetW}:${targetH},setsar=1[br_r${i}]`
+      );
+    }
+
+    // 3d. Overlay each B-roll range on the black base
+    lastLabel = "bg_base";
+    for (let i = 0; i < rangeCount; i++) {
+      const range = ranges[i];
+      const layout = template.layouts[range.layoutId];
+      const brollRegion = layout?.broll?.region ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      const isFullCanvas = layout?.broll?.isBackground &&
+        brollRegion.x <= 1 && brollRegion.y <= 1 &&
+        brollRegion.width >= canvas.width - 2 &&
+        brollRegion.height >= canvas.height - 2;
+
+      const overlayX = isFullCanvas ? 0 : brollRegion.x;
+      const overlayY = isFullCanvas ? 0 : brollRegion.y;
+
+      filters.push(
+        `[${lastLabel}][br_r${i}]overlay=${overlayX}:${overlayY}:` +
+          `enable='${range.enableExpr}'[step${stepNum}]`
+      );
+      lastLabel = `step${stepNum}`;
+      stepNum++;
+    }
+
+    // Rename to [bg] for downstream consistency
+    filters.push(`[${lastLabel}]copy[bg]`);
+    lastLabel = "bg";
+
+  } else if (allBrollIsFullCanvas) {
+    // Fast path: single full-canvas B-roll (original behavior, no offsets)
     filters.push(
       `[0:v]setpts=PTS-STARTPTS,scale=${canvas.width}:${canvas.height}:force_original_aspect_ratio=increase,` +
         `crop=${canvas.width}:${canvas.height},setsar=1[bg]`

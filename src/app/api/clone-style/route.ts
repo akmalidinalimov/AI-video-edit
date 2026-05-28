@@ -339,6 +339,16 @@ export async function POST(request: NextRequest) {
         // Get A-roll transcription from blueprint (reference video transcription)
         const transcription = blueprint.reference.transcription;
 
+        // V3: Extract B-roll scenes for content-aware matching
+        const brollAnalysis = blueprint.broll?.[0];
+        const brollScenes = brollAnalysis?.internalScenes?.map((scene: { start: number; end: number; description: string; contentTags: string[] }) => ({
+          start: scene.start,
+          end: scene.end,
+          contentTags: scene.contentTags ?? [],
+          description: scene.description,
+        })) ?? [];
+        const brollDuration = brollAnalysis?.duration ?? 0;
+
         const editingPlan = buildEditingPlan({
           blueprintSegments: blueprint.reference.segments as unknown as Parameters<typeof buildEditingPlan>[0]["blueprintSegments"],
           transcription: {
@@ -351,6 +361,9 @@ export async function POST(request: NextRequest) {
             aroll: arollPath,
             broll: brollPath,
           },
+          // V3: Pass B-roll scene data for content-aware matching
+          brollScenes: brollScenes.length > 0 ? brollScenes : undefined,
+          brollDuration: brollDuration > 0 ? brollDuration : undefined,
         });
 
         sendSSE({ phase: "building_plan", progress: 55, message: `Plan: ${editingPlan.layoutRanges.length} ranges, ${editingPlan.transitions.length} transitions` });
