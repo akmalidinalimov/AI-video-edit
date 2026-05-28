@@ -1,0 +1,61 @@
+{
+  "entries": [
+    {
+      "id": "lesson_1779833603449_9y81",
+      "category": "verification_lesson",
+      "content": {
+        "description": "A-roll PIP extends outside safe area",
+        "fixApplied": "fix_safe_area",
+        "scoreImprovement": 6.512972764203695,
+        "category": "placement"
+      },
+      "confidence": 1,
+      "times_applied": 7,
+      "tags": [
+        "placement",
+        "minor",
+        "fix_safe_area"
+      ],
+      "created_at": "2026-05-26T22:13:23.449Z",
+      "updated_at": "2026-05-26T23:38:13.491Z"
+    },
+    {
+      "id": "lesson_1779833603453_c2js",
+      "category": "verification_lesson",
+      "content": {
+        "description": "Reference uses hard cuts, but 100% of segments have transitions",
+        "fixApplied": "fix_transitions",
+        "scoreImprovement": 6.512972764203695,
+        "category": "style"
+      },
+      "confidence": 1,
+      "times_applied": 7,
+      "tags": [
+        "style",
+        "minor",
+        "fix_transitions"
+      ],
+      "created_at": "2026-05-26T22:13:23.453Z",
+      "updated_at": "2026-05-26T23:38:13.494Z"
+    },
+    {
+      "id": "lesson_1779838113882_mw42",
+      "category": "verification_lesson",
+      "content": {
+        "description": "PIP shape \"rectangle\" doesn't match reference \"circle\"",
+        "fixApplied": "fix_pip_shape",
+        "scoreImprovement": 2.5,
+        "category": "style"
+      },
+      "confidence": 0.35,
+      "times_applied": 2,
+      "tags": [
+        "style",
+        "minor",
+        "fix_pip_shape"
+      ],
+      "created_at": "2026-05-26T23:28:33.882Z",
+      "updated_at": "2026-05-26T23:38:13.492Z"
+    }
+  ]
+}

@@ -36,6 +36,18 @@ yarn-error.log*
 # vercel
 .vercel
 
+# uploaded/exported media (large binaries)
+public/uploads/
+public/exports/
+public/analysis/
+
+# temporary artifacts
+render-log.txt
+test-results.json
+
+# claude/gstack
+.claude/launch.json
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
