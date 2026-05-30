@@ -15,10 +15,10 @@ import path from "path";
 import fs from "fs";
 import { spawn } from "child_process";
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
-const MAX_SIZE_BYTES = 500 * 1024 * 1024; // 500MB
-const MAX_DURATION_SECONDS = 120; // 2 minutes
+const MAX_SIZE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB (Gemini File API ceiling)
+const MAX_DURATION_SECONDS = 600; // 10 minutes — allow long reference videos
 const ALLOWED_TYPES = new Set([
   "video/mp4",
   "video/quicktime",        // .MOV
@@ -108,7 +108,7 @@ export async function POST(request: NextRequest) {
     if (file.size > MAX_SIZE_BYTES) {
       const sizeMB = (file.size / 1024 / 1024).toFixed(0);
       return NextResponse.json(
-        { error: `File too large: ${sizeMB}MB. Maximum is 500MB.` },
+        { error: `File too large: ${sizeMB}MB. Maximum is 2GB.` },
         { status: 400 }
       );
     }

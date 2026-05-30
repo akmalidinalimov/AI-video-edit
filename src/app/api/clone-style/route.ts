@@ -37,6 +37,7 @@ import { extractAllCoordinates, assignSegmentIds } from "@/lib/analysis/screensh
 import { analyzeARollMaterial, analyzeBRollMaterial } from "@/lib/analysis/materialAnalyzer";
 import { assembleBlueprint } from "@/lib/analysis/crossValidator";
 import { withCache, setCache, getCached } from "@/lib/analysis/analysisCache";
+import { orderArollClipsByNarrative } from "@/lib/analysis/aroll-narrative-orderer";
 
 // Gemini
 import { geminiFlash, geminiPro, geminiFallback } from "@/lib/gemini/client";
@@ -47,6 +48,9 @@ import { REFERENCE_CONSOLIDATED_PROMPT } from "@/lib/gemini/prompts/referenceCon
 import { generateTemplate, extractFaceInfo } from "@/lib/pipeline/template-generator";
 import { buildEditingPlan } from "@/lib/pipeline/plan-builder";
 import { buildRenderArgsWithScript } from "@/lib/pipeline/plan-renderer";
+import { applyCvCorrections } from "@/lib/pipeline/cv-correction";
+import { buildLayoutMap } from "@/lib/pipeline/layout-map";
+import { verifyRender } from "@/lib/pipeline/render-verifier";
 import {
   analyzeNarrativeContext,
   extractSpeechKeywords,
@@ -200,10 +204,21 @@ Return ONLY the JSON, no markdown fences, no explanation.`;
 // ════════════════════════════════════════════════════════════
 
 interface SSEEvent {
-  phase: "analyzing_reference" | "generating_template" | "building_plan" | "rendering" | "complete" | "error";
+  phase: "analyzing_reference" | "generating_template" | "building_plan" | "rendering" | "verifying" | "complete" | "error";
   progress: number;
   message?: string;
   downloadUrl?: string;
+  /** Closed-loop structural verification result (on the complete event) */
+  verification?: {
+    /** Overall style-match percentage (0-100) */
+    overall: number;
+    /** Whether it met the threshold */
+    passed: boolean;
+    /** Number of segments analyzed */
+    segmentsAnalyzed: number;
+    /** Per-dimension average scores (PIP, A-roll, B-roll, text, canvas) */
+    dimensions: Record<string, number>;
+  };
 }
 
 // ════════════════════════════════════════════════════════════
@@ -228,6 +243,12 @@ interface CloneStyleRequest {
    * When provided, takes precedence over brollVideo.
    */
   brollVideos?: string[];
+  /**
+   * Skip the post-render structural verification (Gemini Vision scoring).
+   * Default false — verification runs and returns a style-match score.
+   * Set true for faster renders without the quality badge.
+   */
+  skipVerification?: boolean;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -419,6 +440,51 @@ export async function POST(request: NextRequest) {
         }
 
         // ════════════════════════════════════════════
+        // PHASE 1b: CV Coordinate Correction
+        // ════════════════════════════════════════════
+        // Replace the LLM's unreliable bounding-box estimates with deterministic
+        // computer-vision measurements from the real reference pixels (circle
+        // PIPs, rectangle A-roll, header text + typeface + color spans). This
+        // mutates the blueprint segments in place BEFORE template/plan building.
+        // Cached on the blueprint so repeat requests skip the ~1-2 min measure.
+        if (!(blueprint.reference as unknown as { cvCorrected?: boolean }).cvCorrected) {
+          sendSSE({ phase: "analyzing_reference", progress: 28, message: "Measuring exact coordinates (computer vision)..." });
+          try {
+            const arollMetaForAspect = await getVideoMetadata(arollPath);
+            const sourceAspect = arollMetaForAspect.resolution.width / arollMetaForAspect.resolution.height;
+            const { logs } = await applyCvCorrections({
+              ffmpegPath: getFFmpegPath(),
+              refVideoPath: refPath,
+              canvas: blueprint.canvas,
+              segments: blueprint.reference.segments as unknown as Array<Record<string, unknown>>,
+              sourceAspect,
+              tmpDir: tempDir,
+            });
+            for (const line of logs) console.log(`[clone-style] CV: ${line}`);
+            (blueprint.reference as unknown as { cvCorrected?: boolean }).cvCorrected = true;
+            // Persist the corrected blueprint so future requests skip CV
+            setCache(refPath, "visual_blueprint", blueprint);
+            sendSSE({ phase: "analyzing_reference", progress: 32, message: `Coordinates corrected (${logs.length} elements)` });
+          } catch (err) {
+            console.error("[clone-style] CV correction failed (non-blocking, using LLM estimates):", err);
+          }
+        }
+
+        // Build the reference Layout Map (virtual-coordinate template/library)
+        // from the corrected segments — drives PIP motion animation downstream.
+        const refDuration =
+          blueprint.reference.duration ??
+          (blueprint.reference.segments.length > 0
+            ? blueprint.reference.segments[blueprint.reference.segments.length - 1].end
+            : 0);
+        const layoutMap = buildLayoutMap({
+          segments: blueprint.reference.segments as unknown as Parameters<typeof buildLayoutMap>[0]["segments"],
+          canvas: blueprint.canvas,
+          refDuration,
+          sourceFile: path.basename(refPath),
+        });
+
+        // ════════════════════════════════════════════
         // PHASE 2: Dynamic Template Generation
         // ════════════════════════════════════════════
         sendSSE({ phase: "generating_template", progress: 35, message: "Generating layout template from reference..." });
@@ -456,52 +522,106 @@ export async function POST(request: NextRequest) {
         sendSSE({ phase: "building_plan", progress: 48, message: `Transcribing A-roll (${arollPaths.length} clip${arollPaths.length > 1 ? 's' : ''})...` });
 
         // ── Multi-A-roll transcription ──
-        // Each clip is transcribed independently. Timestamps are offset by the
-        // cumulative duration of preceding clips so they form a continuous timeline.
+        // Two passes when >1 clip is uploaded:
+        //   (1) Transcribe each clip independently (clip-local timestamps).
+        //   (2) Ask Gemini to choose the narrative order, then apply it before
+        //       cumulative-offset stitching. Upload order is rarely narrative
+        //       order — creators shoot out of sequence. Reordering here means
+        //       the renderer's -i input order, the merged transcription, and
+        //       all downstream sentence→clip mapping naturally follow the
+        //       coherent story without changing anything downstream.
+        //   For single A-roll: trivial path, no Gemini call.
+
+        // Pass 1: per-clip transcription + duration probe, keyed by upload index.
+        const rawClips: Array<{
+          uploadIndex: number;
+          path: string;
+          duration: number;
+          words: Array<{ word: string; start: number; end: number }>;
+          sentences: Array<{ text: string; start: number; end: number; semantic_tags?: string[] }>;
+        }> = [];
+        for (let ai = 0; ai < arollPaths.length; ai++) {
+          const clipPath = arollPaths[ai];
+          const clipTranscription = await transcribeAroll(clipPath);
+          const clipMeta = await getVideoMetadata(clipPath);
+          rawClips.push({
+            uploadIndex: ai,
+            path: clipPath,
+            duration: clipMeta.duration,
+            words: clipTranscription.words,
+            sentences: clipTranscription.sentences,
+          });
+        }
+
+        // Pass 2a: decide narrative order (no-op for single clip).
+        let narrativeOrder: number[] = rawClips.map((_, i) => i);
+        let narrativeReason = "single clip — upload order kept";
+        if (rawClips.length > 1) {
+          sendSSE({
+            phase: "building_plan",
+            progress: 49,
+            message: `Ordering ${rawClips.length} A-roll clips by narrative...`,
+          });
+          const result = await orderArollClipsByNarrative(
+            rawClips.map((c) => ({
+              uploadIndex: c.uploadIndex,
+              text: c.sentences.map((s) => s.text).join(" "),
+            }))
+          );
+          narrativeOrder = result.order;
+          narrativeReason = result.reasoning;
+          console.log(
+            `[clone-style] A-roll narrative order: [${narrativeOrder.join(", ")}] ` +
+              `(upload order was [${rawClips.map((_, i) => i).join(", ")}]) — ${narrativeReason}`
+          );
+        }
+
+        // Pass 2b: replay clips in narrative order, applying cumulative offsets.
         const allArollTranscriptions: Array<{
           words: Array<{ word: string; start: number; end: number }>;
           sentences: Array<{ text: string; start: number; end: number; semantic_tags?: string[] }>;
         }> = [];
         const arollClipMeta: Array<{ path: string; duration: number; timelineStart: number }> = [];
+        const orderedArollPaths: string[] = [];
         let cumulativeOffset = 0;
-
-        for (let ai = 0; ai < arollPaths.length; ai++) {
-          const clipPath = arollPaths[ai];
-          const clipTranscription = await transcribeAroll(clipPath);
-
-          // Get clip duration for offset calculation
-          const clipMeta = await getVideoMetadata(clipPath);
-          const clipDuration = clipMeta.duration;
-
-          // Offset timestamps for clips after the first
-          const offsetWords = clipTranscription.words.map((w) => ({
+        for (let pos = 0; pos < narrativeOrder.length; pos++) {
+          const ai = narrativeOrder[pos];
+          const c = rawClips[ai];
+          const offsetWords = c.words.map((w) => ({
             ...w,
             start: w.start + cumulativeOffset,
             end: w.end + cumulativeOffset,
           }));
-          const offsetSentences = clipTranscription.sentences.map((s) => ({
+          const offsetSentences = c.sentences.map((s) => ({
             ...s,
             start: s.start + cumulativeOffset,
             end: s.end + cumulativeOffset,
           }));
-
           allArollTranscriptions.push({
             words: offsetWords,
             sentences: offsetSentences,
           });
-
           arollClipMeta.push({
-            path: clipPath,
-            duration: clipDuration,
+            path: c.path,
+            duration: c.duration,
             timelineStart: cumulativeOffset,
           });
-
-          if (arollPaths.length > 1) {
-            console.log(`[clone-style] A-roll #${ai + 1}: offset=${cumulativeOffset.toFixed(2)}s, duration=${clipDuration.toFixed(2)}s, ${offsetSentences.length} sentences`);
+          orderedArollPaths.push(c.path);
+          if (rawClips.length > 1) {
+            console.log(
+              `[clone-style] A-roll pos #${pos + 1} = upload#${ai + 1}: ` +
+                `offset=${cumulativeOffset.toFixed(2)}s, duration=${c.duration.toFixed(2)}s, ` +
+                `${offsetSentences.length} sentences`
+            );
           }
-
-          cumulativeOffset += clipDuration;
+          cumulativeOffset += c.duration;
         }
+
+        // The renderer reads `arollClipMeta` (now in narrative order) so its -i
+        // inputs match. Replace upload-order arollPaths with narrative-order for
+        // any downstream code that still consumes the bare path list.
+        arollPaths.length = 0;
+        arollPaths.push(...orderedArollPaths);
 
         // Merge all transcriptions into one continuous timeline
         const mergedTranscription = {
@@ -523,7 +643,11 @@ export async function POST(request: NextRequest) {
 
         // ── Multi-B-roll scene extraction ──
         // Collect scenes from ALL B-roll sources with source index tracking
-        const allBrollScenes: Array<{ start: number; end: number; contentTags: string[]; description: string; sourceIndex: number; visibleText?: string[]; uiElements?: string[] }> = [];
+        const allBrollScenes: Array<{
+          start: number; end: number; contentTags: string[]; description: string;
+          sourceIndex: number; visibleText?: string[]; uiElements?: string[];
+          frameContent?: Array<{ timestamp: number; visibleText?: string[]; contentTags: string[] }>;
+        }> = [];
         const brollClipMeta: Array<{ path: string; duration: number; inputIndex: number }> = [];
 
         const brollData = blueprint.broll ?? [];
@@ -540,15 +664,31 @@ export async function POST(request: NextRequest) {
           });
 
           const scenes = brollAnalysis?.internalScenes ?? [];
+          // Get per-frame content for trimming (Improvement #2)
+          const allFrameContent = (brollAnalysis as any)?.frameContent ?? [];
+
           for (const scene of scenes) {
+            const sceneStart = (scene as { start: number }).start;
+            const sceneEnd = (scene as { end: number }).end;
+
+            // Filter frame content to this scene's time range
+            const sceneFrameContent = allFrameContent
+              .filter((f: any) => f.timestamp >= sceneStart && f.timestamp <= sceneEnd)
+              .map((f: any) => ({
+                timestamp: f.timestamp as number,
+                visibleText: f.visibleText as string[] | undefined,
+                contentTags: (f.contentTags ?? []) as string[],
+              }));
+
             allBrollScenes.push({
-              start: (scene as { start: number }).start,
-              end: (scene as { end: number }).end,
+              start: sceneStart,
+              end: sceneEnd,
               contentTags: (scene as { contentTags: string[] }).contentTags ?? [],
               description: (scene as { description: string }).description ?? "",
               sourceIndex: bi,
               visibleText: (scene as any).visibleText ?? [],
               uiElements: (scene as any).uiElements ?? [],
+              frameContent: sceneFrameContent.length > 0 ? sceneFrameContent : undefined,
             });
           }
         }
@@ -609,6 +749,23 @@ export async function POST(request: NextRequest) {
 
         sendSSE({ phase: "building_plan", progress: 53, message: "Building editing plan..." });
 
+        // ── Build sentence → A-roll clip index map for source pairing ──
+        // Each sentence knows which A-roll clip it came from, enabling B-roll N
+        // to be preferred for A-roll N's sentences.
+        const sentenceArollClipMap = new Map<number, number>();
+        {
+          let globalSentIdx = 0;
+          for (let clipIdx = 0; clipIdx < allArollTranscriptions.length; clipIdx++) {
+            for (let _si = 0; _si < allArollTranscriptions[clipIdx].sentences.length; _si++) {
+              sentenceArollClipMap.set(globalSentIdx, clipIdx);
+              globalSentIdx++;
+            }
+          }
+          if (sentenceArollClipMap.size > 0 && arollPaths.length > 1) {
+            console.log(`[clone-style] Source pairing: mapped ${sentenceArollClipMap.size} sentences to ${arollPaths.length} A-roll clips`);
+          }
+        }
+
         const editingPlan = buildEditingPlan({
           blueprintSegments: blueprint.reference.segments as unknown as Parameters<typeof buildEditingPlan>[0]["blueprintSegments"],
           transcription: {
@@ -628,6 +785,10 @@ export async function POST(request: NextRequest) {
           brollDuration: totalBrollDuration > 0 ? totalBrollDuration : undefined,
           // Deep narrative understanding (when available)
           narrativeContext,
+          // Source pairing: sentence → A-roll clip index
+          sentenceArollClipMap: sentenceArollClipMap.size > 0 ? sentenceArollClipMap : undefined,
+          // CV-measured reference Layout Map (drives PIP motion animation)
+          layoutMap,
         });
 
         sendSSE({ phase: "building_plan", progress: 55, message: `Plan: ${editingPlan.layoutRanges.length} ranges, ${editingPlan.transitions.length} transitions` });
@@ -732,10 +893,12 @@ export async function POST(request: NextRequest) {
           });
 
           let stderr = "";
-          const timeoutMs = 180_000; // 3 minutes
+          // 5 minutes — the geq circle-mask filters are CPU-heavy and can run
+          // 75-180s depending on machine load; route maxDuration is 600s.
+          const timeoutMs = 300_000;
           const timer = setTimeout(() => {
             proc.kill("SIGKILL");
-            reject(new Error("FFmpeg render timed out after 3 minutes"));
+            reject(new Error("FFmpeg render timed out after 5 minutes"));
           }, timeoutMs);
 
           proc.stderr?.on("data", (data: Buffer) => {
@@ -794,6 +957,36 @@ export async function POST(request: NextRequest) {
         });
 
         // ════════════════════════════════════════════
+        // PHASE 5: Closed-Loop Verification (best-effort)
+        // ════════════════════════════════════════════
+        // Compare the render against the reference (Gemini Vision, 6 structural
+        // dimensions) and surface a style-match score on the complete event.
+        // Non-blocking: a verification failure just omits the badge.
+        let verification: SSEEvent["verification"];
+        if (!body.skipVerification) {
+          try {
+            sendSSE({ phase: "verifying", progress: 96, message: "Verifying style match..." });
+            const report = await verifyRender({
+              referenceVideoPath: refPath,
+              renderedVideoPath: outputPath,
+              editingPlan,
+              template: dynamicTemplate,
+              threshold: 95,
+              outputDir: path.join(exportsDir, "verification"),
+            });
+            verification = {
+              overall: report.overallMatch,
+              passed: report.passed,
+              segmentsAnalyzed: report.segmentsAnalyzed,
+              dimensions: report.dimensionAverages,
+            };
+            console.log(`[clone-style] Verification: ${report.overallMatch}% (${report.passed ? "PASS" : "FAIL"})`);
+          } catch (err) {
+            console.error("[clone-style] Verification failed (non-blocking):", err);
+          }
+        }
+
+        // ════════════════════════════════════════════
         // COMPLETE
         // ════════════════════════════════════════════
         const stats = fs.statSync(outputPath);
@@ -801,7 +994,10 @@ export async function POST(request: NextRequest) {
           phase: "complete",
           progress: 100,
           downloadUrl: `/exports/${outputFilename}`,
-          message: `Done! ${(stats.size / 1024 / 1024).toFixed(1)}MB rendered`,
+          message: verification
+            ? `Done! ${(stats.size / 1024 / 1024).toFixed(1)}MB · ${verification.overall}% style match`
+            : `Done! ${(stats.size / 1024 / 1024).toFixed(1)}MB rendered`,
+          verification,
         });
 
       } catch (error) {

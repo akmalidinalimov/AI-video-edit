@@ -60,6 +60,12 @@ export interface BrollSceneSummary {
   description: string;
   /** Duration of this scene */
   duration: number;
+  /** Per-frame content data for precise trimming (Improvement #2) */
+  frameContent?: Array<{
+    timestamp: number;
+    visibleText?: string[];
+    contentTags: string[];
+  }>;
 }
 
 /** Result of speech keyword extraction (#4) */
@@ -427,7 +433,8 @@ export function buildArollSummaries(
 
 /**
  * Build B-roll scene summaries from multiple analyses.
- * Now includes visibleText and uiElements for OCR matching (#1).
+ * Now includes visibleText, uiElements for OCR matching (#1),
+ * and frameContent for per-sentence trimming (#2).
  */
 export function buildBrollSummaries(
   analyses: Array<{
@@ -438,6 +445,11 @@ export function buildBrollSummaries(
       contentTags: string[];
       visibleText?: string[];
       uiElements?: string[];
+      frameContent?: Array<{
+        timestamp: number;
+        visibleText?: string[];
+        contentTags: string[];
+      }>;
     }>;
   }>
 ): BrollSceneSummary[] {
@@ -455,6 +467,7 @@ export function buildBrollSummaries(
         uiElements: scene.uiElements,
         description: scene.description,
         duration: scene.end - scene.start,
+        frameContent: scene.frameContent,
       });
     }
   }
@@ -488,6 +501,8 @@ export function summariesToBrollScenes(
       contentTags: summary.contentTags,
       description: summary.description,
       sourceIndex: summary.sourceIndex,
+      visibleText: summary.visibleText,
+      frameContent: summary.frameContent,
     };
   });
 }

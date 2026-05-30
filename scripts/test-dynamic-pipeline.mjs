@@ -546,6 +546,130 @@ const template = generateTemplate(
 // Step 2: Build plan using generated template + A-roll transcription
 const { plan } = buildPlan(template, bpData.reference.segments, transcription);
 
+// Step 2b: Per-segment circle positions
+// The template averages all circle positions into one, but the reference has
+// different circle positions per segment. Split circle ranges into per-sentence
+// sub-ranges, each with its own layout variant using the actual blueprint position.
+console.log("\n╔══════════════════════════════════════════════════╗");
+console.log("║     PER-SEGMENT CIRCLE POSITIONS                 ║");
+console.log("╚══════════════════════════════════════════════════╝\n");
+
+const circleLayoutIds = Object.keys(template.layouts).filter(
+  id => template.layouts[id].aroll.shape === "circle"
+);
+
+if (circleLayoutIds.length > 0) {
+  // Build segment lookup: sentence index → blueprint segment with per-segment bbox
+  const segLookup = new Map();
+  for (const seg of bpData.reference.segments) {
+    if (seg.aroll?.shape === "circle" && seg.aroll.boundingBox) {
+      segLookup.set(seg.id, seg);
+    }
+  }
+
+  // Find circle ranges with multiple sentences
+  const newRanges = [];
+  let rangeNum = 1;
+
+  for (const range of plan.layoutRanges) {
+    const baseLayout = template.layouts[range.layoutId];
+    if (!baseLayout || baseLayout.aroll.shape !== "circle" || range.sentences.length <= 1) {
+      range.id = `range_${rangeNum++}`;
+      newRanges.push(range);
+      continue;
+    }
+
+    console.log(`  Splitting ${range.id} (${range.sentences.length} sentences) into per-sentence ranges...`);
+
+    // Create per-sentence sub-ranges
+    for (let si = 0; si < range.sentences.length; si++) {
+      const sentence = range.sentences[si];
+      const isFirst = si === 0;
+      const isLastSentence = si === range.sentences.length - 1;
+
+      // Time range: sentence boundaries, but first/last align to original range
+      const subStart = isFirst ? range.timeRange.start : alignToFrame(sentence.start);
+      const subEnd = isLastSentence ? range.timeRange.end : alignToFrame(range.sentences[si + 1].start);
+
+      // Find matching blueprint segment by time overlap
+      let bestSeg = null;
+      let bestOverlap = 0;
+      for (const seg of bpData.reference.segments) {
+        if (seg.aroll?.shape !== "circle" || !seg.aroll.boundingBox) continue;
+        const oStart = Math.max(seg.start, sentence.start);
+        const oEnd = Math.min(seg.end, sentence.end);
+        const overlap = Math.max(0, oEnd - oStart);
+        if (overlap > bestOverlap) { bestOverlap = overlap; bestSeg = seg; }
+      }
+
+      // Create per-sentence layout variant with this segment's exact bbox
+      const perSentenceLayoutId = `${range.layoutId}_s${sentence.index + 1}`;
+      const bbox = bestSeg?.aroll?.boundingBox ?? baseLayout.aroll.region;
+      const radius = Math.min(bbox.width, bbox.height) / 2;
+      const circleDef = {
+        cx: bbox.x + bbox.width / 2,
+        cy: bbox.y + bbox.height / 2,
+        radius: Math.round(radius),
+      };
+
+      template.layouts[perSentenceLayoutId] = {
+        id: perSentenceLayoutId,
+        aroll: {
+          region: { x: bbox.x, y: bbox.y, width: bbox.width, height: bbox.height },
+          shape: "circle",
+          circle: circleDef,
+          border: baseLayout.aroll.border,
+          faceCropCenter: baseLayout.aroll.faceCropCenter,
+        },
+        broll: { ...baseLayout.broll },
+        headerZone: null,
+      };
+
+      // Build enable expression
+      const sf = Math.round(subStart * FPS);
+      const ef = Math.round(subEnd * FPS);
+      const isLast = isLastSentence && range === plan.layoutRanges[plan.layoutRanges.length - 1];
+      const enableExpr = buildEnableExpr(sf, ef, isLast);
+
+      const cx = circleDef.cx, cy = circleDef.cy, r = circleDef.radius;
+      console.log(`    S${sentence.index + 1}: ${perSentenceLayoutId} (${subStart.toFixed(2)}-${subEnd.toFixed(2)}s) circle=(${cx},${cy}) r=${r}`);
+
+      newRanges.push({
+        id: `range_${rangeNum++}`,
+        layoutId: perSentenceLayoutId,
+        timeRange: { start: subStart, end: subEnd },
+        sentences: [sentence],
+        textOverlays: [],
+        reasoning: `Per-segment circle position from blueprint (${bestSeg?.id ?? 'unknown'})`,
+        startFrame: sf,
+        endFrame: ef,
+        enableExpr,
+      });
+    }
+  }
+
+  // Replace plan ranges
+  plan.layoutRanges = newRanges;
+
+  // Rebuild transitions
+  plan.transitions = [];
+  for (let i = 0; i < plan.layoutRanges.length - 1; i++) {
+    const curr = plan.layoutRanges[i], next = plan.layoutRanges[i + 1];
+    // Only create transition when base layout type changes (rect→circle)
+    const currBase = curr.layoutId.replace(/_s\d+$/, "");
+    const nextBase = next.layoutId.replace(/_s\d+$/, "");
+    if (currBase !== nextBase) {
+      const frame = Math.round(curr.timeRange.end * FPS);
+      const midpoint = (frame - 0.5) / FPS;
+      plan.transitions.push({ time: curr.timeRange.end, frame, from: curr.layoutId, to: next.layoutId, midpoint });
+    }
+  }
+
+  console.log(`\n  Result: ${plan.layoutRanges.length} ranges, ${Object.keys(template.layouts).length} layouts`);
+} else {
+  console.log("  No circle layouts found, skipping per-segment split.");
+}
+
 // Step 3: Save results
 const outDir = path.join(ROOT, "public", "exports", "sp-temp");
 fs.writeFileSync(path.join(outDir, "dynamic-template.json"), JSON.stringify(template, null, 2));

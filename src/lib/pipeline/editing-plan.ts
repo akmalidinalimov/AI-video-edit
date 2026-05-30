@@ -45,6 +45,8 @@ export interface SentenceInfo {
   index: number;
   /** Semantic tags describing what this sentence is about (e.g., ["app_demo", "tutorial_step"]) */
   semanticTags?: string[];
+  /** Which A-roll clip this sentence came from (0-based index, for multi-clip source pairing) */
+  arollClipIndex?: number;
 }
 
 export interface TextOverlay {
@@ -85,6 +87,33 @@ export interface LayoutRange {
   brollOffset?: number;
   /** B-roll source index (for multi-B-roll support; 0-based) */
   brollSourceIndex?: number;
+  /**
+   * Sub-range keyframes for frame-level keyword sync (Improvement #3).
+   * Within a layout range, specific speech moments are aligned to specific
+   * B-roll frames. The renderer can use these to create sub-offsets within
+   * the range for precise keyword-to-screen synchronization.
+   */
+  brollKeyframes?: Array<{
+    /** When the keyword is spoken in the A-roll timeline (absolute seconds) */
+    speechTime: number;
+    /** The B-roll timestamp showing that keyword's screen (absolute in B-roll source) */
+    brollTime: number;
+    /** The keyword that links speech to screen */
+    keyword: string;
+  }>;
+  /**
+   * Smart crop region for B-roll (Improvement #4).
+   * When set, the renderer zooms into this region of the B-roll frame
+   * to focus on the relevant UI element being discussed.
+   */
+  brollCropRegion?: { x: number; y: number; width: number; height: number };
+  /**
+   * B-roll playback speed multiplier (Improvement #5).
+   * Default 1.0. Range 0.5-2.0. Used when B-roll duration doesn't match
+   * the sentence duration — slow down for static content, speed up for
+   * long screen recordings.
+   */
+  brollSpeed?: number;
 
   // ── Direct replication: per-range coordinate overrides ──
 
@@ -118,8 +147,49 @@ export interface LayoutRange {
       color?: string;
       backgroundColor?: string | null;
       fontWeight?: string;
+      /**
+       * Classified typeface style (category/italic/weight) used to resolve a
+       * matching local font in the renderer. When absent, the renderer infers
+       * a style from color/weight hints.
+       */
+      fontStyle?: {
+        category: "serif" | "display" | "sans" | "rounded" | "script" | "mono";
+        italic?: boolean;
+        weight?: "light" | "regular" | "bold" | "black";
+      };
+      /**
+       * Multi-color spans within one line (e.g. "2026-yil" yellow + "SMM"
+       * white). When present, the renderer draws each span separately at its
+       * measured x with its own color. Absent → single-color line.
+       */
+      spans?: Array<{ text: string; color: string; x: number }>;
     }>;
   };
+
+  /**
+   * A-roll PIP position keyframes (V4 — smooth PIP animation).
+   *
+   * When the reference video's PIP moves/drifts during this range (e.g. the
+   * circle slides from center toward the top-right corner across multiple
+   * reference layout states that all fall inside one edit sentence), these
+   * keyframes describe the trajectory. The renderer animates the overlay
+   * x/y position by piecewise-linear interpolation between keyframes.
+   *
+   * This is NOT a layout-type change (which only happens at sentence
+   * boundaries) — it's a continuous reposition of the same overlay, so it
+   * causes zero audio/video glitches. Times are in absolute edit seconds.
+   *
+   * If absent or length <= 1, the renderer uses the static layoutOverride
+   * position for the whole range.
+   */
+  arollKeyframes?: Array<{
+    /** Absolute time in the edit timeline (seconds) */
+    t: number;
+    /** A-roll overlay top-left X at this time */
+    x: number;
+    /** A-roll overlay top-left Y at this time */
+    y: number;
+  }>;
 
   // ── Pre-computed for renderer ──
 
@@ -406,14 +476,18 @@ export function validateEditingPlan(
     );
   }
 
-  // ── Check 10: Consecutive same-layout ranges should be merged ──
+  // ── Check 10: Consecutive same-layout ranges — only warn if B-roll is identical ──
+  // Per-sentence B-roll switching intentionally creates adjacent same-layout ranges
+  // with different brollOffsets. Only warn if they have the same offset (truly redundant).
   for (let i = 0; i < plan.layoutRanges.length - 1; i++) {
     const curr = plan.layoutRanges[i];
     const next = plan.layoutRanges[i + 1];
-    if (curr.layoutId === next.layoutId) {
+    if (curr.layoutId === next.layoutId &&
+        curr.brollOffset === next.brollOffset &&
+        curr.brollSourceIndex === next.brollSourceIndex) {
       warnings.push(
-        `Adjacent ranges "${curr.id}" and "${next.id}" use the same layout "${curr.layoutId}". ` +
-        `They should be merged to avoid unnecessary transitions.`
+        `Adjacent ranges "${curr.id}" and "${next.id}" use the same layout "${curr.layoutId}" ` +
+        `with identical B-roll. They could be merged.`
       );
     }
   }

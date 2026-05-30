@@ -255,19 +255,42 @@ function buildFilterComplexFromPlan(plan, template, arollSrcW, arollSrcH) {
     branch._adjustedW = targetW;
     branch._adjustedH = targetH;
 
-    const fc = computeFaceCrop(targetW, targetH, faceCenter.x, faceCenter.y, arollSrcW, arollSrcH);
-
     if (branch.shape === "circle") {
+      // ── CIRCLE: Center-crop from 16:9 source → square → circle mask ──
+      // Scale so shorter dimension fills the target square, then center-crop.
+      // This preserves natural camera distance: head + shoulders visible.
+      // Do NOT use computeFaceCrop() here — it over-zooms by 1.5x+ when the
+      // face is off-center vertically, showing only the head with no shoulders.
+      const scale = Math.max(
+        targetW / arollSrcW,
+        targetH / arollSrcH
+      );
+      let scaledW = Math.round(arollSrcW * scale);
+      let scaledH = Math.round(arollSrcH * scale);
+      scaledW += scaledW % 2; // ensure even
+      scaledH += scaledH % 2;
+
+      // Center crop — take the middle square from the scaled frame
+      const cropX = Math.max(0, Math.round((scaledW - targetW) / 2));
+      const cropY = Math.max(0, Math.round((scaledH - targetH) / 2));
+
+      console.log(
+        `  [V4] Circle A-roll: center-crop, no zoom. ` +
+        `${arollSrcW}×${arollSrcH} → scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH} at (${cropX},${cropY})`
+      );
+
       const radius = Math.min(targetW, targetH) / 2;
       const cx = targetW / 2;
       const cy = targetH / 2;
       filters.push(
-        `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${targetW}:${targetH}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}_raw]`
+        `[${branch.label}_src]scale=${scaledW}:${scaledH},crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}_raw]`
       );
       filters.push(
         `[${branch.label}_raw]format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(pow(X-${cx},2)+pow(Y-${cy},2),pow(${radius},2)),255,0)'[${branch.label}]`
       );
     } else {
+      // ── RECTANGLE: Face-centered crop ──
+      const fc = computeFaceCrop(targetW, targetH, faceCenter.x, faceCenter.y, arollSrcW, arollSrcH);
       filters.push(
         `[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${targetW}:${targetH}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}]`
       );

@@ -41,6 +41,8 @@ import {
   printEditingPlan,
 } from "./editing-plan";
 
+import { type LayoutMap, getArollKeyframes, classifyOverlayText } from "./layout-map";
+
 // ════════════════════════════════════════════════════════════
 // TYPES FOR ANALYSIS INPUT
 // ════════════════════════════════════════════════════════════
@@ -69,6 +71,14 @@ export interface BlueprintSegment {
     color: string;
     backgroundColor?: string | null;
     fontWeight?: string;
+    /** Classified typeface style (set by CV/Gemini font classification) */
+    fontStyle?: {
+      category: "serif" | "display" | "sans" | "rounded" | "script" | "mono";
+      italic?: boolean;
+      weight?: "light" | "regular" | "bold" | "black";
+    };
+    /** Multi-color spans within one line (set by CV color-segment detection) */
+    spans?: Array<{ text: string; color: string; x: number }>;
   }>;
   blackRegions?: Array<{
     boundingBox: { x: number; y: number; width: number; height: number };
@@ -102,7 +112,8 @@ export interface Transcription {
  * Returns undefined if the segment lacks usable coordinate data.
  */
 function buildLayoutOverride(
-  bp: BlueprintSegment
+  bp: BlueprintSegment,
+  canvas: { width: number; height: number }
 ): LayoutRange["layoutOverride"] | undefined {
   // Need at minimum the A-roll bounding box
   if (!bp.aroll?.boundingBox) return undefined;
@@ -143,21 +154,41 @@ function buildLayoutOverride(
     }
   }
 
-  // Text elements
+  // Text elements — only genuine editor overlays (headlines/captions in a
+  // header strip), NOT B-roll content text (app UI / screen-recording text).
+  // These are positioned at their exact reference pixel coordinates.
   if (bp.texts?.length) {
-    override.texts = bp.texts.map(t => ({
-      text: t.text,
-      region: {
-        x: t.boundingBox.x,
-        y: t.boundingBox.y,
-        width: t.boundingBox.width,
-        height: t.boundingBox.height,
-      },
-      fontSize: t.estimatedFontSize,
-      color: t.color,
-      backgroundColor: t.backgroundColor,
-      fontWeight: t.fontWeight,
+    const brollIsBackground = override.broll?.isBackground ?? false;
+    const headerRegions = (bp.blackRegions ?? []).map(r => ({
+      region: r.boundingBox,
+      purpose: r.purpose,
     }));
+    const overlayTexts = bp.texts.filter(t =>
+      classifyOverlayText({
+        box: t.boundingBox,
+        isHeadline: t.isHeadline,
+        brollIsBackground,
+        headerRegions,
+        canvas,
+      })
+    );
+    if (overlayTexts.length > 0) {
+      override.texts = overlayTexts.map(t => ({
+        text: t.text,
+        region: {
+          x: t.boundingBox.x,
+          y: t.boundingBox.y,
+          width: t.boundingBox.width,
+          height: t.boundingBox.height,
+        },
+        fontSize: t.estimatedFontSize,
+        color: t.color,
+        backgroundColor: t.backgroundColor,
+        fontWeight: t.fontWeight,
+        fontStyle: t.fontStyle,
+        spans: (t as { spans?: Array<{ text: string; color: string; x: number }> }).spans,
+      }));
+    }
   }
 
   return override;
@@ -384,11 +415,34 @@ function matchBrollScenes(
     console.log(`    Using narrative context: ${narrativeContext.theme} (${narrativeContext.narrativePhases.length} phases)`);
   }
 
+  // ── Source pairing: determine the dominant A-roll clip index per range ──
+  // If sentences in a range came from A-roll clip N, prefer B-roll source N.
+  function getRangeArollClipIndex(range: LayoutRange): number | undefined {
+    const clipIndices = range.sentences
+      .map(s => s.arollClipIndex)
+      .filter((idx): idx is number => idx !== undefined);
+    if (clipIndices.length === 0) return undefined;
+    // Use the most common clip index (majority vote)
+    const counts = new Map<number, number>();
+    for (const idx of clipIndices) {
+      counts.set(idx, (counts.get(idx) ?? 0) + 1);
+    }
+    let bestIdx = clipIndices[0];
+    let bestCount = 0;
+    for (const [idx, count] of counts) {
+      if (count > bestCount) { bestCount = count; bestIdx = idx; }
+    }
+    return bestIdx;
+  }
+
   for (const range of layoutRanges) {
     let bestScene = brollScenes[0];
     let bestScore = -1;
     let bestIdx = 0;
     let matchType = "proportional";
+
+    // Source pairing: bonus for B-roll from the same-index source as the A-roll clip
+    const rangeArollClipIdx = getRangeArollClipIndex(range);
 
     // ── Strategy 1: Narrative context (best) ──
     if (narrativeMap.size > 0 && range.sentences.length > 0) {
@@ -411,6 +465,12 @@ function matchBrollScenes(
         if (sceneIdx >= brollScenes.length) continue;
 
         let score = scores.total;
+
+        // Source pairing bonus: +30 if B-roll source matches A-roll clip index
+        if (rangeArollClipIdx !== undefined && brollScenes[sceneIdx].sourceIndex === rangeArollClipIdx) {
+          score += 30;
+        }
+
         // Penalize heavily-reused scenes
         const usage = sceneUsageCount.get(sceneIdx) ?? 0;
         score *= Math.max(0.3, 1 - usage * 0.2);
@@ -453,6 +513,11 @@ function matchBrollScenes(
 
           if (score <= 0) continue;
 
+          // Source pairing bonus: +30 if B-roll source matches A-roll clip index
+          if (rangeArollClipIdx !== undefined && scene.sourceIndex === rangeArollClipIdx) {
+            score += 30;
+          }
+
           // Penalize heavily-reused scenes to encourage variety
           const usage = sceneUsageCount.get(i) ?? 0;
           score *= Math.max(0.3, 1 - usage * 0.25);
@@ -486,7 +551,51 @@ function matchBrollScenes(
       matchType = "proportional";
     }
 
-    range.brollOffset = bestScene.start;
+    // ── Per-sentence B-roll trimming (Improvement #2) ──
+    // Instead of using the scene's start offset, find the exact frame within
+    // the scene whose OCR/tags best match the sentence keywords.
+    let trimmedOffset = bestScene.start;
+    if (bestScene.frameContent?.length && range.sentences.length > 0) {
+      // Collect keywords from all sentences in this range
+      const keywords: string[] = [];
+      for (const sentence of range.sentences) {
+        const words = sentence.text.split(/\s+/).filter(w => w.length > 3);
+        keywords.push(...words.map(w => w.toLowerCase()));
+      }
+
+      if (keywords.length > 0) {
+        let bestFrameScore = -1;
+        let bestFrameTimestamp = bestScene.start;
+
+        for (const frame of bestScene.frameContent) {
+          // Only consider frames within the scene boundaries
+          if (frame.timestamp < bestScene.start || frame.timestamp > bestScene.end) continue;
+
+          let frameScore = 0;
+          const frameText = [
+            ...(frame.visibleText ?? []),
+            ...frame.contentTags,
+          ].map(t => t.toLowerCase()).join(" ");
+
+          for (const kw of keywords) {
+            if (frameText.includes(kw)) {
+              frameScore += 2;
+            }
+          }
+
+          if (frameScore > bestFrameScore) {
+            bestFrameScore = frameScore;
+            bestFrameTimestamp = frame.timestamp;
+          }
+        }
+
+        if (bestFrameScore > 0) {
+          trimmedOffset = bestFrameTimestamp;
+        }
+      }
+    }
+
+    range.brollOffset = trimmedOffset;
     range.brollSourceIndex = bestScene.sourceIndex ?? 0;
 
     // Track usage
@@ -498,8 +607,227 @@ function matchBrollScenes(
       : "";
     const srcInfo = bestScene.sourceIndex !== undefined && bestScene.sourceIndex > 0 ? ` (broll #${bestScene.sourceIndex})` : "";
     console.log(
-      `    ${range.id}: offset=${bestScene.start.toFixed(2)}s (${matchType})${tagInfo}${sceneInfo}${srcInfo}`
+      `    ${range.id}: offset=${trimmedOffset.toFixed(2)}s (${matchType})${tagInfo}${sceneInfo}${srcInfo}`
     );
+  }
+}
+
+/**
+ * Align B-roll frames to specific speech moments (Improvement #3).
+ *
+ * For each layout range, if the range has multiple sentences with different
+ * keywords, find B-roll frames that match specific keywords and create
+ * sub-offset keyframes within the range. This enables the renderer to
+ * show the right B-roll frame at the exact moment the speaker says a keyword.
+ *
+ * @param layoutRanges - Ranges with brollOffset already assigned (mutated in place)
+ * @param brollScenes - Available B-roll scenes (with frameContent for lookup)
+ */
+function alignBrollToSpeech(
+  layoutRanges: LayoutRange[],
+  brollScenes: BRollScene[]
+): void {
+  for (const range of layoutRanges) {
+    if (range.brollOffset === undefined) continue;
+    if (range.sentences.length < 1) continue;
+
+    // Find the matched scene for this range
+    const matchedScene = brollScenes.find(
+      s => s.sourceIndex === (range.brollSourceIndex ?? 0) &&
+           s.start <= (range.brollOffset ?? 0) &&
+           s.end >= (range.brollOffset ?? 0)
+    );
+    if (!matchedScene?.frameContent?.length) continue;
+
+    const keyframes: Array<{ speechTime: number; brollTime: number; keyword: string }> = [];
+
+    // For each sentence in the range, extract its top keywords and find matching frames
+    for (const sentence of range.sentences) {
+      const words = sentence.text.split(/\s+/).filter(w => w.length > 3);
+      if (words.length === 0) continue;
+
+      for (const word of words) {
+        const wordLower = word.toLowerCase();
+        // Find the B-roll frame whose OCR text best matches this word
+        for (const frame of matchedScene.frameContent) {
+          const frameText = [
+            ...(frame.visibleText ?? []),
+            ...frame.contentTags,
+          ].map(t => t.toLowerCase()).join(" ");
+
+          if (frameText.includes(wordLower)) {
+            // Use the midpoint of the sentence as the speech time for this keyword
+            const speechTime = (sentence.start + sentence.end) / 2;
+            keyframes.push({
+              speechTime,
+              brollTime: frame.timestamp,
+              keyword: word,
+            });
+            break; // One match per keyword is sufficient
+          }
+        }
+      }
+    }
+
+    // Only attach keyframes if we found meaningful alignments
+    if (keyframes.length > 0) {
+      // Deduplicate by brollTime (keep the first occurrence)
+      const seen = new Set<number>();
+      range.brollKeyframes = keyframes.filter(kf => {
+        if (seen.has(kf.brollTime)) return false;
+        seen.add(kf.brollTime);
+        return true;
+      });
+    }
+  }
+}
+
+/**
+ * Smart region cropping for B-roll (Improvement #4).
+ *
+ * When the B-roll shows a full app screen but the speech is about one specific
+ * feature, determine an approximate crop region based on where the matching
+ * OCR text or content tags appear in the frame. Uses a heuristic approach
+ * based on UI element positioning (top/middle/bottom of screen).
+ *
+ * @param layoutRanges - Ranges with brollOffset already assigned (mutated in place)
+ * @param brollScenes - Available B-roll scenes (with frameContent for lookup)
+ */
+function assignBrollCropRegions(
+  layoutRanges: LayoutRange[],
+  brollScenes: BRollScene[]
+): void {
+  for (const range of layoutRanges) {
+    if (range.brollOffset === undefined) continue;
+    if (range.sentences.length === 0) continue;
+
+    // Find the matched scene
+    const matchedScene = brollScenes.find(
+      s => s.sourceIndex === (range.brollSourceIndex ?? 0) &&
+           s.start <= (range.brollOffset ?? 0) &&
+           s.end >= (range.brollOffset ?? 0)
+    );
+    if (!matchedScene?.frameContent?.length) continue;
+
+    // Get keywords from sentences
+    const keywords: string[] = [];
+    for (const sentence of range.sentences) {
+      const words = sentence.text.split(/\s+/).filter(w => w.length > 3);
+      keywords.push(...words.map(w => w.toLowerCase()));
+    }
+    if (keywords.length === 0) continue;
+
+    // Find the best matching frame at the brollOffset
+    const targetFrame = matchedScene.frameContent.find(
+      f => Math.abs(f.timestamp - (range.brollOffset ?? 0)) < 1.0
+    );
+    if (!targetFrame) continue;
+
+    // Check if the matching content is localized to a portion of the screen
+    // by analyzing contentTags for positional hints (navigation, header, sidebar, etc.)
+    const tags = targetFrame.contentTags.map(t => t.toLowerCase()).join(" ");
+    const visText = (targetFrame.visibleText ?? []).join(" ").toLowerCase();
+
+    // Heuristic: if content tags suggest a specific UI region, create a crop
+    // that zooms into that region. Use thirds-based positioning.
+    let region: { x: number; y: number; width: number; height: number } | undefined;
+
+    // Default assumption: 1080x1920 canvas (9:16), B-roll occupies a region within
+    // We don't have exact pixel coordinates from OCR, so use coarse positioning
+    if (tags.includes("navigation") || tags.includes("nav") || tags.includes("menu") || tags.includes("sidebar")) {
+      // Navigation/sidebar: left or top portion
+      region = { x: 0, y: 0, width: 100, height: 50 }; // percentage-based
+    } else if (tags.includes("footer") || tags.includes("bottom") || tags.includes("action") || tags.includes("button")) {
+      // Bottom portion of screen
+      region = { x: 0, y: 60, width: 100, height: 40 }; // percentage-based
+    } else if (tags.includes("header") || tags.includes("title") || tags.includes("top")) {
+      // Top portion
+      region = { x: 0, y: 0, width: 100, height: 40 }; // percentage-based
+    } else if (tags.includes("chart") || tags.includes("graph") || tags.includes("analytics")) {
+      // Center-focused
+      region = { x: 10, y: 20, width: 80, height: 60 }; // percentage-based
+    }
+
+    // Only apply crop if we have a specific region hint AND a keyword match
+    if (region) {
+      let hasKeywordMatch = false;
+      for (const kw of keywords) {
+        if (visText.includes(kw) || tags.includes(kw)) {
+          hasKeywordMatch = true;
+          break;
+        }
+      }
+      if (hasKeywordMatch) {
+        range.brollCropRegion = region;
+      }
+    }
+  }
+}
+
+/**
+ * Duration-aware B-roll speed adjustment (Improvement #5).
+ *
+ * If a sentence is 8s but the best B-roll scene is only 3s, adjust playback
+ * speed to cover the gap. For screen recordings with natural motion (scroll,
+ * animation), prefer using natural speed. For static content, allow slight
+ * slowdown to fill the duration.
+ *
+ * @param layoutRanges - Ranges with brollOffset already assigned (mutated in place)
+ * @param brollScenes - Available B-roll scenes
+ */
+function adjustBrollSpeed(
+  layoutRanges: LayoutRange[],
+  brollScenes: BRollScene[]
+): void {
+  for (const range of layoutRanges) {
+    if (range.brollOffset === undefined) continue;
+
+    const rangeDuration = range.timeRange.end - range.timeRange.start;
+    if (rangeDuration <= 0) continue;
+
+    // Find the matched scene
+    const matchedScene = brollScenes.find(
+      s => s.sourceIndex === (range.brollSourceIndex ?? 0) &&
+           s.start <= (range.brollOffset ?? 0) &&
+           s.end >= (range.brollOffset ?? 0)
+    );
+    if (!matchedScene) continue;
+
+    // Available B-roll duration from the offset to scene end
+    const availableBrollDuration = matchedScene.end - (range.brollOffset ?? matchedScene.start);
+
+    if (availableBrollDuration <= 0) continue;
+
+    // If B-roll has enough duration, no speed adjustment needed
+    if (availableBrollDuration >= rangeDuration) continue;
+
+    // B-roll is shorter than the range — need to handle the gap
+    const ratio = availableBrollDuration / rangeDuration;
+
+    // Check if the scene has motion (based on content tags)
+    const tags = (matchedScene.contentTags ?? []).join(" ").toLowerCase();
+    const hasMotion = tags.includes("scroll") || tags.includes("animation") ||
+                      tags.includes("transition") || tags.includes("pan") ||
+                      tags.includes("typing") || tags.includes("cursor");
+
+    if (hasMotion) {
+      // For motion content: keep natural speed, the renderer will handle
+      // by freezing/extending the last frame past the B-roll's end
+      // (no speed change — natural speed is more important)
+      continue;
+    }
+
+    // For static/slow content: slow down slightly to fill the gap
+    // But never slower than 0.5x (half speed)
+    const speed = Math.max(0.5, ratio);
+
+    // Only apply if the slowdown is meaningful (not too extreme)
+    if (speed < 0.95) {
+      range.brollSpeed = Math.round(speed * 100) / 100; // round to 2 decimals
+      console.log(
+        `    ${range.id}: B-roll ${availableBrollDuration.toFixed(1)}s < range ${rangeDuration.toFixed(1)}s → speed=${range.brollSpeed}x`
+      );
+    }
   }
 }
 
@@ -523,6 +851,12 @@ export interface BRollScene {
   visibleText?: string[];
   /** UI elements detected in this scene */
   uiElements?: string[];
+  /** Per-frame content data for precise trimming (Improvement #2) */
+  frameContent?: Array<{
+    timestamp: number;
+    visibleText?: string[];
+    contentTags: string[];
+  }>;
 }
 
 /**
@@ -584,6 +918,19 @@ export interface PlanBuilderInput {
    * for intelligent B-roll matching instead of shallow tag overlap.
    */
   narrativeContext?: NarrativeContext;
+  /**
+   * Optional: per-sentence A-roll clip index mapping.
+   * Maps global sentence index → A-roll clip index (0-based).
+   * Used for source pairing: B-roll N is preferred for A-roll N's sentences.
+   */
+  sentenceArollClipMap?: Map<number, number>;
+  /**
+   * Optional: the reference Layout Map (virtual coordinate template/library).
+   * When provided, the plan builder computes per-range A-roll PIP position
+   * keyframes so the circle can smoothly follow the reference's motion within
+   * a sentence (glitch-free, since it's a reposition, not a layout-type cut).
+   */
+  layoutMap?: LayoutMap;
 }
 
 /**
@@ -627,6 +974,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     end: s.end,
     index: i,
     semanticTags: s.semantic_tags?.length ? s.semantic_tags : undefined,
+    arollClipIndex: input.sentenceArollClipMap?.get(i),
   }));
 
   interface SentenceLayout {
@@ -694,8 +1042,10 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     });
   }
 
-  // ── Step 2: Merge consecutive same-layout sentences ──
-  console.log("\n  Step 2: Merging consecutive same-layout sentences...");
+  // ── Step 2: Create per-sentence ranges (dynamic B-roll per sentence) ──
+  // Each sentence gets its own LayoutRange so B-roll can change at every
+  // sentence boundary, reflecting what is being said in the A-roll.
+  console.log("\n  Step 2: Creating per-sentence layout ranges (dynamic B-roll)...");
 
   interface MergedRange {
     layoutId: string;
@@ -713,31 +1063,19 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
   const mergedRanges: MergedRange[] = [];
 
   for (const sl of sentenceLayouts) {
-    const prev = mergedRanges[mergedRanges.length - 1];
-    if (prev && prev.layoutId === sl.layoutId) {
-      console.log(
-        `    Merging S${sl.sentence.index + 1} into previous range: same layout '${sl.layoutId}'`
-      );
-      prev.end = sl.sentence.end;
-      prev.sentences.push(sl.sentence);
-      // Merge semantic tags (deduplicate)
-      if (sl.sentence.semanticTags) {
-        for (const tag of sl.sentence.semanticTags) {
-          if (!prev.semanticTags.includes(tag)) prev.semanticTags.push(tag);
-        }
-      }
-    } else {
-      mergedRanges.push({
-        layoutId: sl.layoutId,
-        start: sl.sentence.start,
-        end: sl.sentence.end,
-        sentences: [sl.sentence],
-        blueprintSegment: sl.blueprintSegment,
-        reasoning: sl.reasoning,
-        semanticTags: sl.sentence.semanticTags ? [...sl.sentence.semanticTags] : [],
-        brollContentTags: sl.blueprintSegment.brollContentTags ? [...sl.blueprintSegment.brollContentTags] : [],
-      });
-    }
+    mergedRanges.push({
+      layoutId: sl.layoutId,
+      start: sl.sentence.start,
+      end: sl.sentence.end,
+      sentences: [sl.sentence],
+      blueprintSegment: sl.blueprintSegment,
+      reasoning: sl.reasoning,
+      semanticTags: sl.sentence.semanticTags ? [...sl.sentence.semanticTags] : [],
+      brollContentTags: sl.blueprintSegment.brollContentTags ? [...sl.blueprintSegment.brollContentTags] : [],
+    });
+    console.log(
+      `    S${sl.sentence.index + 1}: own range '${sl.layoutId}' [${sl.sentence.start.toFixed(2)}-${sl.sentence.end.toFixed(2)}s]`
+    );
   }
 
   // ── Step 3: Ensure first range starts at 0 ──
@@ -831,7 +1169,7 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     }
 
     // ── Direct replication: carry exact blueprint coordinates ──
-    const layoutOverride = buildLayoutOverride(mr.blueprintSegment);
+    const layoutOverride = buildLayoutOverride(mr.blueprintSegment, template.canvas);
 
     layoutRanges.push({
       id: `range_${i + 1}`,
@@ -854,6 +1192,64 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     );
   }
 
+  // ── Step 6a: Per-range PIP position logging ──
+  // Each range keeps its own blueprint coordinates from buildLayoutOverride().
+  // The renderer uses per-range override positions for circle overlays,
+  // so each segment's PIP matches its specific reference position.
+  console.log("\n  Step 5a: Per-range PIP positions (direct replication)...");
+  {
+    const layoutGroups = new Map<string, LayoutRange[]>();
+    for (const range of layoutRanges) {
+      const group = layoutGroups.get(range.layoutId) ?? [];
+      group.push(range);
+      layoutGroups.set(range.layoutId, group);
+    }
+
+    for (const [layoutId, ranges] of layoutGroups) {
+      if (ranges.length <= 1) continue;
+      const withOverrides = ranges.filter(r => r.layoutOverride?.aroll?.region);
+      if (withOverrides.length === 0) continue;
+
+      for (const r of withOverrides) {
+        const region = r.layoutOverride!.aroll!.region;
+        console.log(
+          `    ${r.id} [${layoutId}]: A-roll at (${region.x},${region.y},${region.width}x${region.height})`
+        );
+      }
+    }
+  }
+
+  // ── Step 6a': PIP motion keyframes (smooth animation within a sentence) ──
+  // When the reference's circle PIP drifts across multiple reference states
+  // that fall inside a single edit range, animate the overlay position to
+  // follow that motion. This is a reposition (not a layout-type cut), so it
+  // is glitch-free. Requires the Layout Map.
+  if (input.layoutMap) {
+    console.log("\n  Step 5a': Computing PIP motion keyframes from Layout Map...");
+    const editDuration = layoutRanges[layoutRanges.length - 1]?.timeRange.end ?? 0;
+    for (const range of layoutRanges) {
+      const shape = range.layoutOverride?.aroll?.shape
+        ?? (range.layoutId.includes("circle") ? "circle" : "rectangle");
+      if (shape !== "circle") continue;
+
+      const keyframes = getArollKeyframes({
+        map: input.layoutMap,
+        editStart: range.timeRange.start,
+        editEnd: range.timeRange.end,
+        editDuration,
+        shape: "circle",
+      });
+
+      if (keyframes.length >= 2) {
+        range.arollKeyframes = keyframes;
+        const path = keyframes
+          .map(k => `(${Math.round(k.x)},${Math.round(k.y)})@${k.t.toFixed(1)}s`)
+          .join(" → ");
+        console.log(`    ${range.id}: PIP animates ${path}`);
+      }
+    }
+  }
+
   // ── Step 6b: Match B-roll scenes (content-aware offsets) ──
   if (input.brollScenes?.length || input.brollDuration) {
     console.log("\n  Step 5b: Matching B-roll scenes to layout ranges...");
@@ -863,6 +1259,26 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
 
     if (brollDuration > 0) {
       matchBrollScenes(layoutRanges, brollScenes, brollDuration, totalDur, input.narrativeContext);
+
+      // ── Step 6c: Frame-level keyword sync (Improvement #3) ──
+      console.log("\n  Step 5c: Aligning B-roll frames to speech keywords...");
+      alignBrollToSpeech(layoutRanges, brollScenes);
+      const keyframeCount = layoutRanges.filter(r => r.brollKeyframes?.length).length;
+      if (keyframeCount > 0) {
+        console.log(`    ${keyframeCount}/${layoutRanges.length} ranges have keyword-aligned keyframes`);
+      }
+
+      // ── Step 6d: Smart region cropping (Improvement #4) ──
+      console.log("\n  Step 5d: Assigning B-roll crop regions...");
+      assignBrollCropRegions(layoutRanges, brollScenes);
+      const cropCount = layoutRanges.filter(r => r.brollCropRegion).length;
+      if (cropCount > 0) {
+        console.log(`    ${cropCount}/${layoutRanges.length} ranges have smart crop regions`);
+      }
+
+      // ── Step 6e: Duration-aware B-roll handling (Improvement #5) ──
+      console.log("\n  Step 5e: Adjusting B-roll speed for duration mismatches...");
+      adjustBrollSpeed(layoutRanges, brollScenes);
     } else {
       console.log("    Skipped: no B-roll duration available");
     }
