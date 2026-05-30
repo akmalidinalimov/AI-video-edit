@@ -336,12 +336,98 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
     console.log(`  Merged ${clusters.size} clusters → ${mergedClusters.size} unique layout(s)`);
   }
 
+  // ── Step 2c: Split circle-PIP clusters that span diverse vertical positions ──
+  //
+  // V4.4b fix: the speaker's PIP can sit at significantly different Y positions
+  // across segments (e.g. cy≈275 in one segment vs cy≈480-565 in others).
+  // Collapsing all into one layout → the template uses the median cy for all
+  // segments → segments at outlier positions render with a large positional error.
+  //
+  // When the maximum pairwise distance between any two circle centers in the
+  // cluster exceeds CIRCLE_POS_SPLIT_PX (200px), split the cluster into
+  // position-based sub-variants using greedy nearest-neighbour grouping.
+  // Sub-variants inherit a numeric suffix (_pos2, _pos3, …) on the layout ID.
+  const CIRCLE_POS_SPLIT_PX = 200;
+
+  const finalClusters = new Map<string, Array<typeof classified[0]>>();
+  for (const [layoutId, members] of Array.from(mergedClusters.entries())) {
+    // Only apply position splitting to circle PIP layouts
+    if (!layoutId.startsWith("circle_pip")) {
+      finalClusters.set(layoutId, members);
+      continue;
+    }
+
+    const centers = members
+      .filter((m) => m.seg.aroll?.boundingBox)
+      .map((m) => {
+        const b = m.seg.aroll!.boundingBox;
+        return { cx: b.x + b.width / 2, cy: b.y + b.height / 2, m };
+      });
+
+    if (centers.length <= 1) {
+      finalClusters.set(layoutId, members);
+      continue;
+    }
+
+    // Compute max pairwise distance
+    let maxDist = 0;
+    for (let ai = 0; ai < centers.length; ai++) {
+      for (let bi = ai + 1; bi < centers.length; bi++) {
+        const d = Math.hypot(centers[ai].cx - centers[bi].cx, centers[ai].cy - centers[bi].cy);
+        if (d > maxDist) maxDist = d;
+      }
+    }
+
+    if (maxDist <= CIRCLE_POS_SPLIT_PX) {
+      finalClusters.set(layoutId, members);
+      continue;
+    }
+
+    // Greedy nearest-neighbour grouping by circle position
+    const posGroups: Array<{ sumCx: number; sumCy: number; n: number; members: Array<typeof classified[0]> }> = [];
+    for (const { cx, cy, m } of centers) {
+      let nearest = -1, nearestDist = Infinity;
+      for (let gi = 0; gi < posGroups.length; gi++) {
+        const gcx = posGroups[gi].sumCx / posGroups[gi].n;
+        const gcy = posGroups[gi].sumCy / posGroups[gi].n;
+        const d = Math.hypot(cx - gcx, cy - gcy);
+        if (d < CIRCLE_POS_SPLIT_PX && d < nearestDist) {
+          nearest = gi;
+          nearestDist = d;
+        }
+      }
+      if (nearest >= 0) {
+        posGroups[nearest].members.push(m);
+        posGroups[nearest].sumCx += cx;
+        posGroups[nearest].sumCy += cy;
+        posGroups[nearest].n++;
+      } else {
+        posGroups.push({ sumCx: cx, sumCy: cy, n: 1, members: [m] });
+      }
+    }
+
+    if (posGroups.length === 1) {
+      finalClusters.set(layoutId, members);
+    } else {
+      // Sort by centroid Y (topmost/highest variant first = base layoutId)
+      posGroups.sort((a, b) => a.sumCy / a.n - b.sumCy / b.n);
+      console.log(`  Split "${layoutId}" → ${posGroups.length} position variants (maxDist=${Math.round(maxDist)}px)`);
+      posGroups.forEach((g, i) => {
+        const subId = i === 0 ? layoutId : `${layoutId}_pos${i + 1}`;
+        finalClusters.set(subId, g.members);
+        const gcx = Math.round(g.sumCx / g.n);
+        const gcy = Math.round(g.sumCy / g.n);
+        console.log(`    "${subId}": ${g.members.length} segment(s), centroid=(${gcx},${gcy})`);
+      });
+    }
+  }
+
   // ── Step 3: Build layout variants ──
   console.log("\n  Step 3: Building layout variants...");
 
   const layouts: Record<string, LayoutVariant> = {};
 
-  for (const [layoutId, members] of Array.from(mergedClusters.entries())) {
+  for (const [layoutId, members] of Array.from(finalClusters.entries())) {
     // Use the fingerprint from the cluster with the most segments (dominant)
     // Group members back by original fingerprint key to find dominant
     const subGroups = new Map<string, typeof members>();
@@ -437,6 +523,12 @@ export function generateTemplate(input: TemplateGeneratorInput): VCSTemplate {
         ? aggregateBoundingBoxes(brollBoxes)
         : { x: 0, y: 0, width: canvas.width, height: canvas.height };
       brollIsBackground = fp.brollFullCanvas;
+      // V4.4a: when B-roll is the background, ensure the region covers the full
+      // canvas even if the Gemini bbox analysis returned a slightly smaller area
+      // (e.g., measuring only the visible portion around the A-roll overlay).
+      if (brollIsBackground) {
+        brollRegion = { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      }
     }
     console.log(`      B-roll region: (${brollRegion.x}, ${brollRegion.y}) ${brollRegion.width}×${brollRegion.height} (bg=${brollIsBackground})`);
 

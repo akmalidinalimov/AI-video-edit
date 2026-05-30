@@ -30,6 +30,8 @@ import type {
 } from "./editing-plan";
 import { combineEnableExprs } from "./editing-plan";
 import type { VCSTemplate, LayoutVariant } from "./vcs-templates";
+import { buildOverlayExpr } from "./layout-map";
+import { resolveFontForStyle, inferStyleFromHints } from "./font-registry";
 
 // ════════════════════════════════════════════════════════════
 // TYPES
@@ -242,6 +244,29 @@ function escapeDrawtext(text: string): string {
 }
 
 /**
+ * Normalize a color string for FFmpeg drawtext.
+ * Converts "#RRGGBB" → "0xRRGGBB"; passes through "0x..." and color names.
+ */
+function normalizeColor(c?: string | null): string | undefined {
+  if (!c) return undefined;
+  const s = c.trim();
+  if (s.startsWith("#")) return "0x" + s.slice(1);
+  return s;
+}
+
+/**
+ * Pick a font file for a map-driven overlay text based on its color/weight.
+ * Gold/yellow → headline font; bold → bold; otherwise regular.
+ */
+function pickOverlayFont(fontColor: string, isBold: boolean): string {
+  const c = fontColor.toUpperCase();
+  if (c.includes("FDD835") || c.includes("FFD700") || c.includes("FFEB3B")) {
+    return DEFAULT_FONTS.headline;
+  }
+  return isBold ? DEFAULT_FONTS.bold : DEFAULT_FONTS.regular;
+}
+
+/**
  * Determine the font file path for a text overlay.
  */
 function resolveFontFile(
@@ -295,6 +320,47 @@ export function buildFilterComplex(
   const arollInputBase = brollInputCount; // First A-roll input index (e.g., 1 for single B-roll)
   const brollInputBase = 0; // First B-roll input index
 
+  // ── Multi-A-roll concat ──
+  // When >1 A-roll clip is uploaded each is a separate FFmpeg input. The filter
+  // graph must concatenate them into one continuous video+audio stream so the
+  // single-pass renderer can treat them as one. Downstream filters reference
+  // [aroll_v] (video) and [aroll_a] (audio) instead of the raw input.
+  // For single-A-roll setups [aroll_v]/[aroll_a] are simple passthroughs of
+  // input [arollInputBase:v/a] — same behavior, uniform downstream API.
+  const arollClipCount = plan.sources.arollClips?.length ?? 1;
+  const arollVideoLabel = "aroll_v";
+  const arollAudioLabel = "aroll_a";
+
+  // Emit the concat / passthrough stage now so downstream filters see a uniform
+  // [aroll_v]/[aroll_a] interface regardless of clip count. Each input is
+  // normalized to the timeline fps and to the first clip's pixel dimensions
+  // (concat needs uniform tb/size). Audio resampled to 44.1k stereo fltp.
+  const _aw = arollSourceDimensions.width;
+  const _ah = arollSourceDimensions.height;
+  if (arollClipCount > 1) {
+    const concatPairs: string[] = [];
+    for (let i = 0; i < arollClipCount; i++) {
+      const ii = arollInputBase + i;
+      const vl = `a${i}vp`;
+      const al = `a${i}ap`;
+      filters.push(
+        `[${ii}:v]fps=${fps},scale=${_aw}:${_ah}:force_original_aspect_ratio=decrease,` +
+          `pad=${_aw}:${_ah}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[${vl}]`
+      );
+      filters.push(
+        `[${ii}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[${al}]`
+      );
+      concatPairs.push(`[${vl}][${al}]`);
+    }
+    filters.push(
+      `${concatPairs.join("")}concat=n=${arollClipCount}:v=1:a=1[${arollVideoLabel}][${arollAudioLabel}]`
+    );
+  } else {
+    // Passthrough so downstream reference [aroll_v]/[aroll_a] is always valid.
+    filters.push(`[${arollInputBase}:v]copy[${arollVideoLabel}]`);
+    filters.push(`[${arollInputBase}:a]anull[${arollAudioLabel}]`);
+  }
+
   // ── Step 1: Group ranges by layout ──
   const groups = groupRangesByLayout(plan, template);
 
@@ -313,12 +379,23 @@ export function buildFilterComplex(
   }
 
   // ── Step 2: Identify what A-roll branches we need ──
-  // Each unique layout with A-roll needs its own crop branch
+  //
+  // RECTANGLE layouts: ONE branch per layout group (all ranges share dimensions)
+  // CIRCLE layouts: ONE branch PER RANGE — each range uses its own blueprint
+  // dimensions (x, y, width, height) for pixel-precise replication of the
+  // reference video's PIP placement. This is critical because the reference
+  // video may have different circle sizes and positions per segment.
   const arollBranches: Array<{
     layoutId: string;
     shape: "rectangle" | "circle";
     label: string;
     layout: LayoutVariant;
+    /** Per-range override region (for circles with per-range branches) */
+    overrideRegion?: { x: number; y: number; width: number; height: number };
+    /** Range ID (for per-range branches) */
+    rangeId?: string;
+    /** Enable expression (for per-range branches) */
+    enableExpr?: string;
   }> = [];
 
   for (const group of groups) {
@@ -330,12 +407,30 @@ export function buildFilterComplex(
     ) {
       continue;
     }
-    arollBranches.push({
-      layoutId: group.layoutId,
-      shape: layout.aroll.shape,
-      label: `aroll_${group.layoutId}`,
-      layout,
-    });
+
+    if (layout.aroll.shape === "circle") {
+      // Per-range branches for circles — each gets its own dimensions
+      for (const range of group.ranges) {
+        const overrideRegion = range.layoutOverride?.aroll?.region;
+        arollBranches.push({
+          layoutId: group.layoutId,
+          shape: "circle",
+          label: `aroll_${range.id}`,
+          layout,
+          overrideRegion: overrideRegion ?? undefined,
+          rangeId: range.id,
+          enableExpr: range.enableExpr,
+        });
+      }
+    } else {
+      // Rectangle: one branch per group
+      arollBranches.push({
+        layoutId: group.layoutId,
+        shape: layout.aroll.shape,
+        label: `aroll_${group.layoutId}`,
+        layout,
+      });
+    }
   }
 
   // ── Step 3: B-roll preparation ──
@@ -413,27 +508,51 @@ export function buildFilterComplex(
       const offset = range.brollOffset ?? 0;
       const rangeStart = range.timeRange.start;
       const layout = template.layouts[range.layoutId];
-      // Direct replication: prefer per-range override coordinates over template
-      const brollRegion = range.layoutOverride?.broll?.region
-        ?? layout?.broll?.region
-        ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      // When the template layout says B-roll is background, always use full
+      // canvas — override coordinates from individual blueprint segments may
+      // have slightly smaller regions that leave black bars.
+      const templateBg = layout?.broll?.isBackground ?? false;
       const overrideBg = range.layoutOverride?.broll?.isBackground;
-      const templateBg = layout?.broll?.isBackground;
-      const isFullCanvas = (overrideBg ?? templateBg) &&
-        brollRegion.x <= 1 && brollRegion.y <= 1 &&
-        brollRegion.width >= canvas.width - 2 &&
-        brollRegion.height >= canvas.height - 2;
+      const isBackground = overrideBg ?? templateBg;
+      const brollRegion = isBackground
+        ? { x: 0, y: 0, width: canvas.width, height: canvas.height }
+        : (range.layoutOverride?.broll?.region
+            ?? layout?.broll?.region
+            ?? { x: 0, y: 0, width: canvas.width, height: canvas.height });
+      const isFullCanvas = isBackground;
 
       const targetW = isFullCanvas ? canvas.width : brollRegion.width;
       const targetH = isFullCanvas ? canvas.height : brollRegion.height;
 
-      // trim → setpts (shift to range position) → scale/crop
-      filters.push(
-        `[br_r${i}_src]trim=start=${offset.toFixed(4)},` +
-          `setpts=PTS-STARTPTS+${rangeStart.toFixed(4)},` +
-          `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,` +
-          `crop=${targetW}:${targetH},setsar=1[br_r${i}]`
-      );
+      // Build the filter chain: trim → speed → setpts → scale/crop
+      let filterChain = `[br_r${i}_src]trim=start=${offset.toFixed(4)},`;
+
+      // Improvement #5: Apply speed adjustment if B-roll is shorter than range
+      if (range.brollSpeed && range.brollSpeed !== 1.0) {
+        const ptsFactor = (1 / range.brollSpeed).toFixed(4);
+        filterChain += `setpts=${ptsFactor}*PTS,`;
+      }
+
+      filterChain += `setpts=PTS-STARTPTS+${rangeStart.toFixed(4)},`;
+
+      // Improvement #4: Smart region cropping — zoom into relevant region
+      if (range.brollCropRegion) {
+        // brollCropRegion is percentage-based, convert to pixels relative to source
+        // First scale to a larger size to allow cropping with zoom effect
+        const cr = range.brollCropRegion;
+        const zoomW = Math.round(targetW * (100 / cr.width));
+        const zoomH = Math.round(targetH * (100 / cr.height));
+        const cropX = Math.round(zoomW * cr.x / 100);
+        const cropY = Math.round(zoomH * cr.y / 100);
+
+        filterChain += `scale=${zoomW}:${zoomH}:force_original_aspect_ratio=increase,` +
+          `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[br_r${i}]`;
+      } else {
+        filterChain += `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,` +
+          `crop=${targetW}:${targetH},setsar=1[br_r${i}]`;
+      }
+
+      filters.push(filterChain);
     }
 
     // 3d. Overlay each B-roll range on the black base
@@ -441,19 +560,14 @@ export function buildFilterComplex(
     for (let i = 0; i < rangeCount; i++) {
       const range = ranges[i];
       const layout = template.layouts[range.layoutId];
-      // Direct replication: prefer per-range override coordinates
-      const brollRegion = range.layoutOverride?.broll?.region
-        ?? layout?.broll?.region
-        ?? { x: 0, y: 0, width: canvas.width, height: canvas.height };
-      const overrideBg = range.layoutOverride?.broll?.isBackground;
-      const templateBg = layout?.broll?.isBackground;
-      const isFullCanvas = (overrideBg ?? templateBg) &&
-        brollRegion.x <= 1 && brollRegion.y <= 1 &&
-        brollRegion.width >= canvas.width - 2 &&
-        brollRegion.height >= canvas.height - 2;
+      // Same logic as 3c: background B-roll always uses full canvas
+      const templateBg2 = layout?.broll?.isBackground ?? false;
+      const overrideBg2 = range.layoutOverride?.broll?.isBackground;
+      const isBackground2 = overrideBg2 ?? templateBg2;
+      const isFullCanvas = isBackground2;
 
-      const overlayX = isFullCanvas ? 0 : brollRegion.x;
-      const overlayY = isFullCanvas ? 0 : brollRegion.y;
+      const overlayX = isFullCanvas ? 0 : (range.layoutOverride?.broll?.region?.x ?? layout?.broll?.region?.x ?? 0);
+      const overlayY = isFullCanvas ? 0 : (range.layoutOverride?.broll?.region?.y ?? layout?.broll?.region?.y ?? 0);
 
       filters.push(
         `[${lastLabel}][br_r${i}]overlay=${overlayX}:${overlayY}:` +
@@ -527,7 +641,7 @@ export function buildFilterComplex(
     if (arollBranches.length === 1) {
       // Single branch — no split needed
       filters.push(
-        `[${arollInputBase}:v]setpts=PTS-STARTPTS[${arollBranches[0].label}_src]`
+        `[${arollVideoLabel}]setpts=PTS-STARTPTS[${arollBranches[0].label}_src]`
       );
     } else {
       // Multiple branches — split A-roll
@@ -535,7 +649,7 @@ export function buildFilterComplex(
         .map((b) => `[${b.label}_src]`)
         .join("");
       filters.push(
-        `[${arollInputBase}:v]setpts=PTS-STARTPTS,split=${arollBranches.length}${splitLabels}`
+        `[${arollVideoLabel}]setpts=PTS-STARTPTS,split=${arollBranches.length}${splitLabels}`
       );
     }
 
@@ -556,74 +670,82 @@ export function buildFilterComplex(
       const region = branch.layout.aroll.region;
 
       if (branch.shape === "rectangle") {
-        // ── RECTANGLE: Scale to fit, NO crop ──
-        // scale=targetW:-2 auto-computes height preserving aspect ratio
-        // and ensures even dimensions. Full source frame is shown.
+        // ── RECTANGLE: Scale to fill and crop to region ──
+        // Scale so the source fills the target region in both dimensions,
+        // then crop to the exact region size. This matches the reference
+        // more closely — the reference had tighter framing.
         const targetW = region.width;
-        // Compute actual height for overlay positioning
+        const targetH = region.height;
+        // Compute actual scaled size after fill
         const sourceAspect = arollSourceDimensions.width / arollSourceDimensions.height;
-        let scaledH = Math.round(targetW / sourceAspect);
-        scaledH = scaledH + (scaledH % 2); // ensure even
+        const targetAspect = targetW / targetH;
+        let scaledW: number, scaledH: number;
+        if (sourceAspect > targetAspect) {
+          // Source is wider — scale by height, crop width
+          scaledH = targetH;
+          scaledW = Math.round(targetH * sourceAspect);
+        } else {
+          // Source is taller — scale by width, crop height
+          scaledW = targetW;
+          scaledH = Math.round(targetW / sourceAspect);
+        }
+        scaledW = scaledW + (scaledW % 2); // ensure even
+        scaledH = scaledH + (scaledH % 2);
+
+        // Center crop
+        const cropX = Math.round((scaledW - targetW) / 2);
+        const cropY = Math.round((scaledH - targetH) / 2);
 
         // Store adjusted dimensions on the branch for overlay positioning
         (branch as Record<string, unknown>)._adjustedW = targetW;
-        (branch as Record<string, unknown>)._adjustedH = scaledH;
+        (branch as Record<string, unknown>)._adjustedH = targetH;
 
         console.log(
-          `  [V6] Rectangle A-roll: scale-to-fit (NO crop). ` +
-          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → ${targetW}×${scaledH}`
+          `  [V6] Rectangle A-roll: scale-to-fill + crop. ` +
+          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH}`
         );
 
         filters.push(
-          `[${branch.label}_src]scale=${targetW}:-2,setsar=1[${branch.label}]`
+          `[${branch.label}_src]scale=${scaledW}:${scaledH},crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}]`
         );
       } else {
-        // ── CIRCLE: Crop a region around the speaker, convert to circle ──
+        // ── CIRCLE: Center-crop from 16:9 source → square → circle mask ──
         //
-        // Goal: maintain the same distance from camera as the source video.
-        // Shoulders should be visible. The circle crops a square region from
-        // the talking head footage and converts it to a circle mask.
+        // Simple approach: scale the source so the shorter dimension (height)
+        // matches the circle target size, then center-crop a square from the
+        // wider dimension (width). This preserves the natural camera distance
+        // and framing — shoulders remain visible, no artificial zoom.
         //
-        // zoomBoost = 1.3x over base scale: shows face + upper chest/shoulders
-        // at approximately the same framing as the source, just cropped to a
-        // smaller area. This matches typical reference video circle PIP framing.
-        const targetW = region.width;
-        const targetH = region.height;
+        // Per-range: each branch may have its own dimensions from the blueprint.
+        const circleRegion = branch.overrideRegion ?? region;
+        const targetW = circleRegion.width;
+        const targetH = circleRegion.height;
 
         // Store dimensions for overlay positioning
         (branch as Record<string, unknown>)._adjustedW = targetW;
         (branch as Record<string, unknown>)._adjustedH = targetH;
 
-        // Crop center: source center horizontally, upper-38% vertically
-        // (faces are typically in the upper portion of talking head footage)
-        const cropCenterX = Math.round(arollSourceDimensions.width / 2);
-        const cropCenterY = Math.round(arollSourceDimensions.height * 0.38);
-
-        // Zoom: base scale * modest boost — keep natural camera distance
-        // 1.3x shows face + shoulders; 2.0x was too zoomed in
-        const baseScale = Math.max(
+        // Scale so shorter source dimension fills the target square
+        // For 16:9 source (1920×1080), height is shorter → scale by height
+        const scale = Math.max(
           targetW / arollSourceDimensions.width,
           targetH / arollSourceDimensions.height
         );
-        const zoomBoost = 1.3;
-        const scale = baseScale * zoomBoost;
 
         let scaledW = Math.round(arollSourceDimensions.width * scale);
         let scaledH = Math.round(arollSourceDimensions.height * scale);
         scaledW += scaledW % 2; // ensure even
         scaledH += scaledH % 2;
 
-        // Center crop on the face position
-        const faceX = Math.round(cropCenterX * scale);
-        const faceY = Math.round(cropCenterY * scale);
-        const cropX = Math.max(0, Math.min(faceX - Math.round(targetW / 2), scaledW - targetW));
-        const cropY = Math.max(0, Math.min(faceY - Math.round(targetH / 2), scaledH - targetH));
+        // Center crop — take the middle square from the scaled frame
+        const cropX = Math.max(0, Math.round((scaledW - targetW) / 2));
+        const cropY = Math.max(0, Math.round((scaledH - targetH) / 2));
 
+        const rangeInfo = branch.rangeId ? ` (${branch.rangeId})` : "";
         console.log(
-          `  [V6] Circle A-roll: zoom=${scale.toFixed(3)} (base=${baseScale.toFixed(3)} * ${zoomBoost}x). ` +
-          `Center: (${cropCenterX},${cropCenterY}). Scale: ${scaledW}x${scaledH}. ` +
-          `Crop: ${targetW}x${targetH} at (${cropX},${cropY}). ` +
-          `Face in crop: (${faceX - cropX},${faceY - cropY})`
+          `  [V4] Circle A-roll${rangeInfo}: center-crop, no zoom. ` +
+          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → ` +
+          `scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH} at (${cropX},${cropY})`
         );
 
         // Circle: crop to square, then apply circular mask
@@ -708,103 +830,218 @@ export function buildFilterComplex(
     }
 
     // ── 5c. Circle border ──
+    // V4: Per-range borders — each range has its own circle size and position
+    // from the blueprint. Border dimensions match the range's circle dimensions.
     if (layout.aroll.shape === "circle" && layout.aroll.border) {
-      const region = layout.aroll.region;
       const border = layout.aroll.border;
       const bw = border.width;
 
-      const borderW = region.width + bw * 2;
-      const borderH = region.height + bw * 2;
-      const borderR = Math.min(borderW, borderH) / 2;
-      const borderCx = borderW / 2;
-      const borderCy = borderH / 2;
+      for (let ri = 0; ri < group.ranges.length; ri++) {
+        const range = group.ranges[ri];
+        const circleRegion = range.layoutOverride?.aroll?.region ?? layout.aroll.region;
+        const rangeEnable = `'${range.enableExpr}'`;
 
-      filters.push(
-        `color=${border.color}:s=${borderW}x${borderH}:r=${fps}:d=999,` +
-          `setpts=PTS-STARTPTS[bdr_${group.layoutId}_color]`
-      );
-      filters.push(
-        `[bdr_${group.layoutId}_color]format=yuva420p,` +
-          `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':` +
-          `a='if(lt(pow(X-${borderCx},2)+pow(Y-${borderCy},2),pow(${borderR},2)),255,0)'` +
-          `[bdr_${group.layoutId}]`
-      );
-      filters.push(
-        `[${lastLabel}][bdr_${group.layoutId}]overlay=${region.x - bw}:${region.y - bw}:` +
-          `enable=${enableStr}:format=auto[step${stepNum}]`
-      );
-      lastLabel = `step${stepNum}`;
-      stepNum++;
+        const borderW = circleRegion.width + bw * 2;
+        const borderH = circleRegion.height + bw * 2;
+        const borderR = Math.min(borderW, borderH) / 2;
+        const borderCx = borderW / 2;
+        const borderCy = borderH / 2;
+
+        filters.push(
+          `color=${border.color}:s=${borderW}x${borderH}:r=${fps}:d=999,` +
+            `setpts=PTS-STARTPTS[bdr_${range.id}_color]`
+        );
+        filters.push(
+          `[bdr_${range.id}_color]format=yuva420p,` +
+            `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':` +
+            `a='if(lt(pow(X-${borderCx},2)+pow(Y-${borderCy},2),pow(${borderR},2)),255,0)'` +
+            `[bdr_${range.id}]`
+        );
+
+        // V4: animate position if the range has PIP motion keyframes
+        const kf = range.arollKeyframes;
+        const xExpr = kf && kf.length >= 2
+          ? `'${buildOverlayExpr(kf, "x", -bw)}'`
+          : `${circleRegion.x - bw}`;
+        const yExpr = kf && kf.length >= 2
+          ? `'${buildOverlayExpr(kf, "y", -bw)}'`
+          : `${circleRegion.y - bw}`;
+
+        filters.push(
+          `[${lastLabel}][bdr_${range.id}]overlay=${xExpr}:${yExpr}:` +
+            `enable=${rangeEnable}:format=auto[step${stepNum}]`
+        );
+        lastLabel = `step${stepNum}`;
+        stepNum++;
+      }
     }
 
     // ── 5d. Circle A-roll ──
+    // V4: Per-range A-roll overlay — each range has its own A-roll branch
+    // (created in step 2) with its own dimensions, and is overlaid at its
+    // own blueprint position.
     if (layout.aroll.shape === "circle" && layout.aroll.region.width > 0) {
-      const region = layout.aroll.region;
-      const branchLabel = `aroll_${group.layoutId}`;
+      for (let ri = 0; ri < group.ranges.length; ri++) {
+        const range = group.ranges[ri];
+        const circleRegion = range.layoutOverride?.aroll?.region ?? layout.aroll.region;
+        const branchLabel = `aroll_${range.id}`;
+        const rangeEnable = `'${range.enableExpr}'`;
 
-      filters.push(
-        `[${lastLabel}][${branchLabel}]overlay=${region.x}:${region.y}:` +
-          `enable=${enableStr}:format=auto[step${stepNum}]`
-      );
-      lastLabel = `step${stepNum}`;
-      stepNum++;
+        // V4: animate position if the range has PIP motion keyframes
+        const kf = range.arollKeyframes;
+        const xExpr = kf && kf.length >= 2
+          ? `'${buildOverlayExpr(kf, "x", 0)}'`
+          : `${circleRegion.x}`;
+        const yExpr = kf && kf.length >= 2
+          ? `'${buildOverlayExpr(kf, "y", 0)}'`
+          : `${circleRegion.y}`;
+
+        filters.push(
+          `[${lastLabel}][${branchLabel}]overlay=${xExpr}:${yExpr}:` +
+            `enable=${rangeEnable}:format=auto[step${stepNum}]`
+        );
+        lastLabel = `step${stepNum}`;
+        stepNum++;
+      }
     }
 
     // ── 5e. Text overlays ──
-    // Collect text overlays from all ranges in this group
-    const allTextOverlays: TextOverlay[] = [];
-    for (const range of group.ranges) {
-      if (range.textOverlays && range.textOverlays.length > 0) {
-        allTextOverlays.push(...range.textOverlays);
+    //
+    // PRIMARY (map-driven): when ranges carry exact overlay-text coordinates
+    // from the Layout Map (layoutOverride.texts — already filtered to genuine
+    // editor overlays, B-roll content text excluded), render each at its exact
+    // reference pixel position with its own color/weight/background. Rendered
+    // per-range so positions can differ per segment.
+    //
+    // FALLBACK (slot-based): when no map texts exist, use the template's
+    // header text slots (backward compatible).
+    const groupHasMapTexts = group.ranges.some(
+      (r) => (r.layoutOverride?.texts?.length ?? 0) > 0
+    );
+
+    // Authoritative gate: on a full-screen background-B-roll layout, any
+    // detected text is B-roll content (app UI), NOT an editor overlay — never
+    // re-draw it. The template's isBackground flag is the reliable signal
+    // (blueprint per-segment bboxes can be imprecise).
+    const layoutIsBackgroundBroll = layout.broll.isBackground;
+
+    if (groupHasMapTexts && !layoutIsBackgroundBroll) {
+      for (const range of group.ranges) {
+        const rangeEnable = `'${range.enableExpr}'`;
+        const mapTexts = range.layoutOverride?.texts ?? [];
+        for (const t of mapTexts) {
+          const cleanText = escapeDrawtext(t.text);
+          if (!cleanText) continue;
+
+          // Size the font to fill the reference text box height. Headlines
+          // fill their bounding box, so box height is a more reliable size
+          // signal than the (often-underestimated) per-glyph estimate.
+          const boxFont = Math.round(t.region.height * 0.92);
+          const fontSize = Math.max(t.fontSize ?? 0, boxFont, 18);
+          const fontColor = normalizeColor(t.color) ?? "0xFFFFFF";
+          const isBold = (t.fontWeight ?? "").toLowerCase().includes("bold");
+          // Resolve a matching local font: prefer the classified style, else
+          // infer from color/weight hints.
+          const style = t.fontStyle ?? inferStyleFromHints({
+            fontColor,
+            bold: isBold,
+            isHeadline: true,
+          });
+          const fontFile = resolveFontForStyle(style);
+
+          // Exact pixel position: top-left of the reference text box
+          const tx = Math.round(t.region.x);
+          const ty = Math.round(t.region.y);
+
+          // Background box (drawn tight around text)
+          let bgOpts = "";
+          const bg = normalizeColor(t.backgroundColor);
+          if (bg) {
+            bgOpts = `:box=1:boxcolor=${bg}:boxborderw=12`;
+          }
+
+          // Multi-color line: render each color span separately at its measured
+          // x with its own color (e.g. "2026-yil" yellow + "SMM" white).
+          if (t.spans && t.spans.length >= 2) {
+            for (const span of t.spans) {
+              const spanText = escapeDrawtext(span.text);
+              if (!spanText) continue;
+              const spanColor = normalizeColor(span.color) ?? fontColor;
+              const sx = Math.round(span.x);
+              filters.push(
+                `[${lastLabel}]drawtext=fontfile='${fontFile}':` +
+                  `text='${spanText}':fontsize=${fontSize}:fontcolor=${spanColor}:` +
+                  `x=${sx}:y=${ty}:enable=${rangeEnable}[step${stepNum}]`
+              );
+              lastLabel = `step${stepNum}`;
+              stepNum++;
+            }
+          } else {
+            filters.push(
+              `[${lastLabel}]drawtext=fontfile='${fontFile}':` +
+                `text='${cleanText}':fontsize=${fontSize}:fontcolor=${fontColor}:` +
+                `x=${tx}:y=${ty}${bgOpts}:enable=${rangeEnable}[step${stepNum}]`
+            );
+            lastLabel = `step${stepNum}`;
+            stepNum++;
+          }
+        }
       }
-    }
-
-    // Deduplicate by slotId (same slot with same text = same overlay)
-    const seenSlots = new Set<string>();
-    const uniqueOverlays: TextOverlay[] = [];
-    for (const overlay of allTextOverlays) {
-      const key = `${overlay.slotId}:${overlay.text}`;
-      if (!seenSlots.has(key)) {
-        seenSlots.add(key);
-        uniqueOverlays.push(overlay);
-      }
-    }
-
-    for (const overlay of uniqueOverlays) {
-      const cleanText = escapeDrawtext(overlay.text);
-      if (!cleanText) continue;
-
-      // Find the slot definition for positioning
-      const slot = layout.headerZone?.textSlots.find(
-        (s) => s.id === overlay.slotId
-      );
-
-      const fontSize = overlay.fontSize ?? slot?.defaultFontSize ?? 36;
-      const fontColor =
-        overlay.fontColor ?? slot?.defaultFontColor ?? "0xFFFFFF";
-      const fontFile = resolveFontFile(overlay, layout, template);
-
-      // Position: center text on the slot anchor
-      const textX = slot?.anchor.x ?? canvas.width / 2;
-      const textY = slot?.anchor.y ?? canvas.height / 2;
-
-      // Background box
-      let bgOpts = "";
-      const bgColor =
-        overlay.bgColor ?? slot?.defaultBgColor;
-      if (bgColor) {
-        const bgPad = overlay.bgPadding ?? slot?.defaultBgPadding ?? 10;
-        bgOpts = `:box=1:boxcolor=${bgColor}:boxborderw=${bgPad}`;
+    } else {
+      // Collect text overlays from all ranges in this group
+      const allTextOverlays: TextOverlay[] = [];
+      for (const range of group.ranges) {
+        if (range.textOverlays && range.textOverlays.length > 0) {
+          allTextOverlays.push(...range.textOverlays);
+        }
       }
 
-      filters.push(
-        `[${lastLabel}]drawtext=fontfile='${fontFile}':` +
-          `text='${cleanText}':fontsize=${fontSize}:fontcolor=${fontColor}:` +
-          `x=${Math.round(textX)}-(tw/2):y=${Math.round(textY)}-(th/2)` +
-          `${bgOpts}:enable=${enableStr}[step${stepNum}]`
-      );
-      lastLabel = `step${stepNum}`;
-      stepNum++;
+      // Deduplicate by slotId (same slot with same text = same overlay)
+      const seenSlots = new Set<string>();
+      const uniqueOverlays: TextOverlay[] = [];
+      for (const overlay of allTextOverlays) {
+        const key = `${overlay.slotId}:${overlay.text}`;
+        if (!seenSlots.has(key)) {
+          seenSlots.add(key);
+          uniqueOverlays.push(overlay);
+        }
+      }
+
+      for (const overlay of uniqueOverlays) {
+        const cleanText = escapeDrawtext(overlay.text);
+        if (!cleanText) continue;
+
+        // Find the slot definition for positioning
+        const slot = layout.headerZone?.textSlots.find(
+          (s) => s.id === overlay.slotId
+        );
+
+        const fontSize = overlay.fontSize ?? slot?.defaultFontSize ?? 36;
+        const fontColor =
+          overlay.fontColor ?? slot?.defaultFontColor ?? "0xFFFFFF";
+        const fontFile = resolveFontFile(overlay, layout, template);
+
+        // Position: center text on the slot anchor
+        const textX = slot?.anchor.x ?? canvas.width / 2;
+        const textY = slot?.anchor.y ?? canvas.height / 2;
+
+        // Background box
+        let bgOpts = "";
+        const bgColor = overlay.bgColor ?? slot?.defaultBgColor;
+        if (bgColor) {
+          const bgPad = overlay.bgPadding ?? slot?.defaultBgPadding ?? 10;
+          bgOpts = `:box=1:boxcolor=${bgColor}:boxborderw=${bgPad}`;
+        }
+
+        filters.push(
+          `[${lastLabel}]drawtext=fontfile='${fontFile}':` +
+            `text='${cleanText}':fontsize=${fontSize}:fontcolor=${fontColor}:` +
+            `x=${Math.round(textX)}-(tw/2):y=${Math.round(textY)}-(th/2)` +
+            `${bgOpts}:enable=${enableStr}[step${stepNum}]`
+        );
+        lastLabel = `step${stepNum}`;
+        stepNum++;
+      }
     }
   }
 
@@ -871,9 +1108,8 @@ export function buildRenderArgs(input: RenderInput): RenderOutput {
     inputArgs.push("-i", clip.path);
   }
 
-  // A-roll inputs
+  // A-roll inputs (one -i per uploaded clip; concat happens inside filtergraph)
   const arollClips = plan.sources.arollClips ?? [{ path: plan.sources.aroll, duration: 0, timelineStart: 0 }];
-  const arollInputBaseIdx = brollClips.length; // First A-roll input index
   for (const clip of arollClips) {
     inputArgs.push("-i", clip.path);
   }
@@ -888,9 +1124,10 @@ export function buildRenderArgs(input: RenderInput): RenderOutput {
     // Map video from filter output
     "-map",
     "[out]",
-    // Map audio from first A-roll input — continuous, never cut
+    // Map audio from the concatenated A-roll stream (works for 1..N clips).
+    // The filter graph emits [aroll_a] regardless of clip count.
     "-map",
-    `${arollInputBaseIdx}:a`,
+    `[aroll_a]`,
     // Duration
     "-t",
     plan.totalDuration.toFixed(3),
