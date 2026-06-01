@@ -1,0 +1,7 @@
+# Phase B Python deps — installed into scripts/python/.venv (Python 3.12 via uv)
+# WhisperX: word-level ASR + wav2vec2 forced alignment + VAD (timing)
+whisperx
+# MediaPipe: face/pose detection for robust crop boxes (spatial)
+mediapipe
+opencv-python
+pillow

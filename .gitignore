@@ -51,3 +51,16 @@ test-results.json
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Python envs + downloaded model weights (large / regenerable)
+scripts/python/.venv/
+scripts/python/.venv-vision/
+scripts/python/.torch/
+scripts/python/models/
+
+# Scratch / tooling
+*.log
+.test-*.log
+.claude-flow/
+.swarm/
+.claude/
