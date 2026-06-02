@@ -127,8 +127,22 @@ async function main() {
     const verifyArgs = ["scripts/multi-aroll-verify.mjs", "--method", String(method)];
     if (useGemini) verifyArgs.push("--gemini");
     const ok = run(verifyArgs, "verify");
-    if (ok) { ready = true; break; }
-    console.log("  A non-crop gate failed (see above). These are deterministic — surfacing for fix.");
+    if (!ok) {
+      console.log("  A non-crop gate failed (see above). These are deterministic — surfacing for fix.");
+      break;
+    }
+
+    // 5. B-ROLL RELEVANCE (content gate, --gemini). Re-checks the RENDERED output:
+    //    does each segment's background actually depict its speech? Below-threshold
+    //    segments are surfaced for re-match/generation (a larger action than a numeric
+    //    tune, so we don't auto-loop) but do NOT block A-roll readiness on their own.
+    if (useGemini && fs.existsSync(path.join(STAGE2, "broll-plan.json"))) {
+      console.log("\n── B-roll relevance (output re-analysis) ──");
+      const brollOk = run(["scripts/multi-aroll-broll-verify.mjs", "--method", String(method)], "broll-verify");
+      if (!brollOk) console.log("  ⚠ Some B-roll segments are below the relevance threshold (see report) — consider re-match/generation.");
+    }
+
+    ready = true;
     break;
   }
 

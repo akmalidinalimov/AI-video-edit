@@ -14,6 +14,13 @@
  *   0 = all checks pass
  *   1 = regression detected (details printed)
  *
+ * SCOPE: this suite is STRUCTURAL (+ a few render checks via --full) for the FFmpeg
+ * pipeline. The render-based A-ROLL gates — word completeness, head-safe crop, no
+ * black-flash at cuts, output transcript — are the closed loop's job and MUST be run
+ * before presenting ANY A-roll edit (any render path). See the "A-ROLL DEFINITION OF
+ * DONE" checklist in docs/aroll-pipeline.md. FFmpeg circle-PIP: multi-aroll-closed-loop.mjs.
+ * Remotion split-screen: reel2-crop-check.mjs + reel2-cut-check.mjs + reel2-transcribe.mjs.
+ *
  * ══════════════════════════════════════════════════════════════
  * ADDING A NEW CHECK:
  * When you fix a bug, add a check function to the appropriate
@@ -29,6 +36,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
+import { validateDirective } from "./lib/broll/contract.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -672,6 +680,60 @@ function check_multiaroll_crop_headsafe() {
   return { pass: false, details: violations.join("\n     ") };
 }
 
+// MA6 — content-aware B-roll plan covers every segment with an in-bounds window.
+// Guards the content-aware B-roll (per-segment background) from silently reverting
+// to one static window or going stale: every timeline segment must appear in the
+// plan, and each circle segment's brollStartSec must sit inside the b-roll source.
+function check_multiaroll_broll_plan() {
+  const PLAN = path.join(ROOT, "public/exports/multi-aroll/stage2/broll-plan.json");
+  const TL = path.join(ROOT, "public/exports/multi-aroll/stage2/clean-timeline.json");
+  if (!fs.existsSync(PLAN)) return { pass: true, details: "No broll-plan.json (static B-roll — skipped)" };
+  const plan = maLoad(PLAN), tl = maLoad(TL);
+  if (!plan || !tl) return { pass: true, details: "Plan/timeline unreadable (skipped)" };
+  const nSeg = tl.segments.length;
+  const violations = [];
+  for (let i = 0; i < nSeg; i++) {
+    const p = plan.segments.find(s => s.seg === i);
+    if (!p) { violations.push(`seg${i} missing from plan`); continue; }
+    if (p.broll === null) continue; // hook: legitimately no b-roll
+    // Ordered generated BEATS (B-roll generation system): each beat clip must exist on disk.
+    if (Array.isArray(p.beats) && p.beats.length) {
+      for (const b of p.beats) {
+        if (!b.source) violations.push(`seg${i} beat (order ${b.order}) has no source`);
+        else if (!fs.existsSync(path.join(ROOT, b.source))) violations.push(`seg${i} beat ${b.source} missing on disk`);
+      }
+      continue;
+    }
+    if (p.brollStartSec == null) { violations.push(`seg${i} has no brollStartSec`); continue; }
+    // A generated (B4) source must exist on disk; a main-B-roll window must be in-bounds.
+    if (p.source) {
+      if (!fs.existsSync(path.join(ROOT, p.source))) violations.push(`seg${i} source ${p.source} missing on disk`);
+    } else {
+      const dur = plan.brollDuration ?? 0;
+      if (dur && p.brollStartSec >= dur) violations.push(`seg${i} brollStartSec ${p.brollStartSec} >= b-roll dur ${dur}`);
+    }
+  }
+  if (violations.length === 0) return { pass: true, details: `${nSeg} segments covered; windows in-bounds (dur ${plan.brollDuration}s)` };
+  return { pass: false, details: violations.join("\n     ") };
+}
+
+// MA8 — content-aware B-roll generation manifest validates against the CONTRACT.
+// Guards the isolation boundary: every directive a strategy emitted must have a valid
+// contentType and well-formed beats (order + kind; generated beats need model + prompt).
+function check_multiaroll_broll_contract() {
+  const MAN = path.join(ROOT, "public/exports/multi-aroll/stage2/broll-gen-manifest.json");
+  if (!fs.existsSync(MAN)) return { pass: true, details: "No generation manifest (skipped)" };
+  const m = maLoad(MAN);
+  if (!m || !Array.isArray(m.segments)) return { pass: true, details: "Manifest unreadable (skipped)" };
+  const violations = [];
+  for (const sg of m.segments) {
+    const v = validateDirective({ contentType: sg.contentType, beats: sg.beats });
+    if (!v.ok) violations.push(`seg${sg.seg}: ${v.errors.join("; ")}`);
+  }
+  if (violations.length === 0) return { pass: true, details: `${m.segments.length} directive(s) valid against the contract` };
+  return { pass: false, details: violations.join("\n     ") };
+}
+
 // ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
@@ -752,6 +814,16 @@ async function main() {
   record(
     "Multi-aroll: crop target is head-safe (top gap)",
     ...Object.values(check_multiaroll_crop_headsafe())
+  );
+
+  record(
+    "Multi-aroll: content-aware B-roll plan covers every segment",
+    ...Object.values(check_multiaroll_broll_plan())
+  );
+
+  record(
+    "Multi-aroll: B-roll generation manifest valid against the contract",
+    ...Object.values(check_multiaroll_broll_contract())
   );
 
   // ── Layer 2: Full Verification ──

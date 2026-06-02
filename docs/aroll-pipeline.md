@@ -9,6 +9,44 @@
 > Run it: `node scripts/aroll-pipeline.mjs --gemini`
 > (stages are also independently runnable; see each below.)
 
+## A-ROLL DEFINITION OF DONE (the pre-flight checklist — every gate must pass on the RENDERED output)
+
+Before presenting ANY A-roll edit — any layout, any renderer — confirm ALL of these. Each line is a
+defect class we have actually shipped by accident; the gate is how you catch it. Verify on the
+**rendered output**, not the plan or the source clips.
+
+- [ ] **Words complete** — every segment keeps its intended sentence(s) whole; no clipped first/last word.
+      (deterministic word check; trims come from MMS-aligned word edges, never raw Gemini sentence times)
+- [ ] **No mid-word start** — no turn/segment begins or ends inside a word. (boundary-guard re-transcribes
+      the OUTPUT; MMS alignment is what makes this reliable)
+- [ ] **Head-safe crop, every sampled frame** — head + shoulders in frame with a top gap; the head is
+      NEVER clipped, for ANY layout (circle PIP OR stack/band). Position the crop by FACE-BOX CENTER so a
+      lean doesn't clip the chin. (YuNet on the rendered output: `crop-check`)
+- [ ] **Lip-sync (only if an AI-character layer mirrors the speech)** — generate ONE lip-sync clip PER
+      turn from that turn's EXACT audio; never a concatenated clip + per-turn seek (mouth desyncs).
+- [ ] **Continuity at cuts — NO black/blank flash** — hard cuts are instant; no fade-from-black, no
+      seek-black, no blank circle. (FFmpeg: contiguous `enable=` ranges; Remotion: `OffthreadVideo`
+      everywhere + fade only the FIRST segment. Verify with a per-frame brightness probe: `cut-check`)
+- [ ] **Audio continuous, no overlap** — one speaker at a time, no dead air at a junction, no doubled voices.
+- [ ] **Output re-transcription clean** — transcribe the finished video: full dialogue, in order, no
+      overlap, `audioIssues` empty.
+
+## Render paths are interchangeable; the gates are NOT
+
+This pipeline has shipped two render paths: **(A)** reel-1's single-pass **FFmpeg** circle-PIP renderer
+(`multi-aroll-stage3-4.mjs`), and **(B)** reel-2's **Remotion** stacked/split-screen composition
+(`src/remotion/compositions/Reel2Video.tsx`). The *gates above are identical for both* — only the
+mechanics differ (e.g. continuity = contiguous `enable=` ranges in FFmpeg vs `OffthreadVideo` + first-only
+fade in Remotion; crop = circle mask vs band/stack placement, but head-safety is checked the same way on
+the rendered output).
+
+> **META-RULE (the lesson that cost us 3 iterations): a NEW A-roll render path inherits NONE of these
+> gates automatically.** When you build or port a pipeline, wire EVERY gate from the checklist before
+> presenting. Reel-2's split-screen path re-discovered clipped words, a cropped head, and a black-flash
+> at cuts — each a gate reel-1 already had but that wasn't carried over. Porting a pipeline = porting all
+> its gates. The Remotion-path gate tools are `scripts/reel2-crop-check.mjs`, `scripts/reel2-cut-check.mjs`,
+> and `scripts/reel2-transcribe.mjs`; the FFmpeg-path closed loop is `scripts/multi-aroll-closed-loop.mjs`.
+
 ## The two non-negotiables
 
 1. **Never cut a word or sentence.** Every rendered segment must contain its
@@ -124,6 +162,8 @@ is advisory (its Uzbek transcription isn't self-consistent enough to be a hard g
 | Clip registry (generic) | `scripts/lib/aroll-clips.mjs` (reads `stage1-summary.json`) |
 | Trim logic | `scripts/lib/trim-validator.mjs` |
 | Forced alignment | `scripts/python/align_mms.py` |
-| Closed loop | `scripts/multi-aroll-closed-loop.mjs` |
+| Closed loop (FFmpeg path) | `scripts/multi-aroll-closed-loop.mjs` |
 | Boundary guard | `scripts/lib/boundary-guard.mjs` |
+| Remotion-path gates | `scripts/reel2-crop-check.mjs` (head-safe), `scripts/reel2-cut-check.mjs` (no black-flash), `scripts/reel2-transcribe.mjs` (output transcript) |
+| Remotion A-roll builder | `scripts/reel2-build-act1.mjs` (transcribe → MMS-align → word-anchor turns → head-safe band crop → rebuild props) |
 | Regression suite | `scripts/test-regression.mjs` |

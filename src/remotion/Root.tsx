@@ -1,6 +1,7 @@
 import React from "react";
 import { Composition, type CalculateMetadataFunction } from "remotion";
 import { StyleCloneVideo, type StyleCloneVideoProps } from "./compositions/StyleCloneVideo";
+import { Reel2Video, type Reel2Props } from "./compositions/Reel2Video";
 import { VDIM } from "./utils/vdim";
 import { DEFAULT_RENDER_CONFIG } from "@/lib/types/render";
 import type { CaptionStyle } from "@/lib/types/timeline";
@@ -33,8 +34,27 @@ export const RemotionRoot: React.FC = () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const VideoComponent = StyleCloneVideo as unknown as React.ComponentType<Record<string, unknown>>;
 
+  // Reel 2 — IMG_6298 split-screen/tutorial grammar (distinct per-segment sources)
+  const Reel2Component = Reel2Video as unknown as React.ComponentType<Record<string, unknown>>;
+  const calcReel2: CalculateMetadataFunction<Reel2Props> = async ({ props }) => ({
+    durationInFrames: Math.max(1, props.durationInFrames || 300),
+    fps: props.fps || VDIM.FPS,
+  });
+
   return (
     <>
+      {/* Reel 2: cloned IMG_6298 editing style */}
+      <Composition
+        id="Reel2Video"
+        component={Reel2Component}
+        durationInFrames={300}
+        fps={VDIM.FPS}
+        width={VDIM.WIDTH}
+        height={VDIM.HEIGHT}
+        calculateMetadata={calcReel2 as CalculateMetadataFunction<Record<string, unknown>>}
+        defaultProps={{ fps: VDIM.FPS, width: VDIM.WIDTH, height: VDIM.HEIGHT, durationInFrames: 300, logoText: "AI", segments: [] }}
+      />
+
       {/* Main 9:16 vertical video */}
       <Composition
         id="StyleCloneVideo"

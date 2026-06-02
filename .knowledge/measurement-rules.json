@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "purpose": "Append-only knowledge base of measurement and rendering rules learned from prior reference videos. Every rule is loaded by the relevant agent at runtime; new rules are added only when a failure mode is observed and reproduced. We never delete rules and we never silently re-learn the same lesson.",
+  "rules": [
+    {
+      "id": "KB-001",
+      "domain": "circle-pip-detection",
+      "rule": "Never trust the LLM's layout-class label (e.g. 'circle_pip_top_right') as a hard constraint on PIP search region. The LLM consistently picks the most-common pattern from training data regardless of where the speaker's PIP actually sits in this specific video. Treat the label as a SOFT prior, not a hard zone.",
+      "evidence": "Session 2026-05-30: Reference video had the speaker's circular PIP in mid-canvas-center for segments 2/3/4 and only at top-right for segment 5. The LLM classified the layout as 'circle_pip_top_right' globally. CV search constrained to top-right quadrant (xMin=40%, yMin=10% of canvas) found nothing for segs 2-4 and silently fell back to the LLM's raw bounding boxes, which had y=-120 (off-screen above). Verification scored 93.7% structurally but the circle was visually wrong in 4/5 segments.",
+      "encoded_in": [
+        "agents/position-measurer/system-prompt.md §3.2",
+        "src/lib/analysis/reference-measurer.ts ## defaults"
+      ],
+      "regression_test": "tests/kb-001-llm-position-prior.test.ts"
+    },
+    {
+      "id": "KB-002",
+      "domain": "circle-pip-detection",
+      "rule": "Full-canvas Hough circle search without a semantic anchor admits FALSE circles from B-roll content. Background app UIs commonly contain large circular profile thumbnails (200-300 px diameter) that pass typical radius gates. The global-median aggregation step then locks onto these false positives. ALWAYS either (a) seed CV search per-segment with a semantic identification (Gemini Vision 'where is the speaker's PIP overlay'), or (b) validate each detection by face-in-circle check.",
+      "evidence": "Session 2026-05-30 Task 3: Replaced LLM-position-seeded centerRegion with 5-95% full-canvas envelope. The reference's B-roll contained TikTok-style profile thumbnails in the radius range [211, 348]. CV detection picked thumbnails as circle candidates; global-cx median collapsed to (471, varies) which is mid-canvas-center. Verification score dropped 93.7% -> 82%, PIP-position dimension dropped 8.2 -> 3.4. Side-by-side confirmed PIP visually in wrong position.",
+      "encoded_in": [
+        "agents/position-measurer/system-prompt.md §3.4",
+        "src/lib/pipeline/cv-correction.ts ## seed-or-validate"
+      ],
+      "regression_test": "tests/kb-002-broll-false-circles.test.ts"
+    },
+    {
+      "id": "KB-003",
+      "domain": "verification",
+      "rule": "Gemini-Vision judge sampling one frame per segment is blind to three failure modes: (1) frozen PIP video — a single still frame looks identical to live video at that timestamp; (2) intra-segment animation — keyframes within a segment are never inspected; (3) systematic positional bias matching a common pattern — top-right placement gets 8/10 from the judge even when the reference is mid-canvas because top-right matches a recognizable style. Always supplement the judge with: pixel diff between rendered_cx and reference_cx, AND multi-frame extraction (>=4 timestamps) within each segment to detect freeze/animation.",
+      "evidence": "Session 2026-05-30 Task 1: Pre-fix render had PIP frozen on first A-roll's last frame (only IMG_6326 used for entire 24.7s). Gemini judge scored it 88%. Post-fix render had live PIP. Gemini judge scored that 88% too. The judge could not tell. User identified the freeze visually. Manual 4-frame extraction within seg_2 (t=3.5/5/6.5/8) confirmed freeze (identical face poses) vs fix (4 distinct poses).",
+      "encoded_in": [
+        "agents/replication-verifier/system-prompt.md §2",
+        "tests/verification-multiframe.test.ts"
+      ],
+      "regression_test": "tests/kb-003-freeze-detection.test.ts"
+    },
+    {
+      "id": "KB-006",
+      "domain": "circle-pip-detection",
+      "rule": "DRAFT — Face-anchored PIP detection (asking Gemini for the speaker's face bbox instead of asking for the PIP center) has the SAME wrong-element disambiguation problem as direct PIP queries. When the reference frame contains multiple faces — speaker face + B-roll profile thumbnails of other creators — Gemini frequently picks a thumbnail face instead of the speaker's, even with explicit prompt disambiguation ('wearing glasses', 'wearing hijab', 'inside clear circular border', 'significantly larger than thumbnails'). Symptom: per-segment radius varies wildly (125, 254, 231, 149 px) when the real speaker's circle is constant at ~215 px throughout the video — Gemini found smaller B-roll faces in segments 2/5, the real face in seg 3, and a partial face in seg 4. Conclusion: any single-frame Gemini Vision query is unreliable for THIS class of video (multiple visible faces) regardless of whether we ask for circles or faces. Required next strategy: temporal-persistence vote across many frames per segment, OR a vision model specifically trained for the speaker (face embedding match across frames), OR pixel-level CV with a face-template that is computed ONCE from a known-good frame.",
+      "evidence": "Session 2026-05-30 Phase 0 v3 (Option C): Face-anchored locator with 3 frames per segment, median position, ±300 px CV refine pad. Per-segment deltas vs reference: seg_2 (745,565,r=205)->(578,263,r=125) — 167+302+80 off; seg_3 (793,518,r=218)->(779,540,r=254) — 14+22+36 OK; seg_4 (755,485,r=215)->(608,219,r=231) — 147+266+16 off; seg_5 (685,275,r=215)->(785,389,r=149) — 100+114+66 off. 1 of 4 within ±50 px gate. Score 87.7 % (vs 86.3 prior, vs 93.7 baseline). Radius variance 125-254 directly indicates wrong-face detection, not bbox imprecision.",
+      "encoded_in": [
+        "DRAFT — pending user direction"
+      ],
+      "regression_test": "tests/kb-006-multi-face-disambiguation.test.ts (TODO)",
+      "status": "draft"
+    },
+    {
+      "id": "KB-005",
+      "domain": "circle-pip-detection",
+      "rule": "DRAFT — Gemini Vision per-segment PIP-locator returns center coordinates with systematic positional error of 100-220 px on portrait 1080x1920 canvases, not the ±150 px commonly assumed. A ±200 px CV-refine pad around the Gemini seed is therefore INSUFFICIENT — when the seed is off by more than the pad, CV cannot reach the real circle and falls back to the seed itself (which is still wrong). Required adjustments to test: (a) widen seed pad to ±350 px AND (b) reject any CV detection whose face-detection check fails (face must be inside detected circle), AND (c) verify across all reference videos that Gemini's error is not directionally biased (in this session the error pulled the seed toward canvas center, suggesting a 'safe middle' bias when the prompt is ambiguous about which circle is the PIP).",
+      "evidence": "Session 2026-05-30 Phase 0: Implemented per-segment Gemini Vision PIP-locator + CV refine in ±200 px window. Per-segment deltas vs reference (REF center -> OUT center): seg_2 (745,565)->(525,410) = 220px+155px off; seg_3 (793,518)->(780,538) = 13px+20px OK; seg_4 (755,485)->(665,300) = 90px+185px off; seg_5 (685,275)->(780,385) = 95px+110px off. 1 of 4 segments within the 30 px visual gate. Score 86.3% (below 93.7% baseline). The CV refinement DID propagate to plan layoutOverride correctly (verified seg_2 plan = (524,432) matches CV output) — the failure is upstream in the semantic seed quality, not in the wiring.",
+      "encoded_in": [
+        "DRAFT — pending user direction on whether to (a) widen pad, (b) add face validation, or (c) different approach entirely"
+      ],
+      "regression_test": "tests/kb-005-gemini-pip-seed-pad.test.ts (TODO)",
+      "status": "draft"
+    },
+    {
+      "id": "KB-004",
+      "domain": "rendering",
+      "rule": "When N>1 A-roll inputs are passed to FFmpeg, the filter graph MUST concat them inside filter_complex into [aroll_v] and [aroll_a] streams. Direct reference to [arollInputBase:v] uses only the first input; subsequent A-roll inputs become dead weight and FFmpeg freezes on the first input's last frame for the remainder of the timeline. Audio map MUST also use [aroll_a], not the raw input's :a channel.",
+      "evidence": "Session 2026-05-30 Task 1: 4 A-rolls passed (IMG_6326 3.0s, IMG_6327 5.9s, IMG_6328 8.4s, IMG_6329 5.3s). Filter graph used [arollInputBase:v] which is input 0 (IMG_6326). Output was 24.7s with frozen PIP from t=3.0 onward. Audio map was 0:a so audio was silent past t=3.0. Fix added per-input normalize (fps + scale + pad + format + aresample) then concat=n=K:v=1:a=1. Output size went 1.6 MB -> 2.7 MB indicating actual moving video data.",
+      "encoded_in": [
+        "src/lib/pipeline/plan-renderer.ts ## multi-aroll-concat"
+      ],
+      "regression_test": "tests/kb-004-multi-aroll-concat.test.ts"
+    }
+  ]
+}

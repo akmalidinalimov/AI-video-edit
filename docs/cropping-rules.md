@@ -99,8 +99,23 @@ Converged head-safe values live in `reference-circle-target.json`
 (`faceFraction ~0.48`, `faceCenterYIn ~0.457`); the crop-check auto-tunes them from
 YuNet measurements on the rendered circle.
 
+## Position by FACE CENTER, and a band is a CROP — never a stretch
+
+Position the crop window by the **face-box CENTER** at a target fraction of the
+region (≈0.45–0.46), as `calculateSquareCrop` does (`faceCenterYIn`). This is robust
+when the speaker LEANS IN: the face moves but its center stays near the same fraction,
+so neither the head-top nor the chin clips. Anchoring to the (estimated) head-top is
+fragile — it over-gives headroom and clips the chin on lean-in shots (reel-2 §13).
+
+If the reference layout uses a wide BAND for the talking head (not a square — e.g.
+reel-2's split-screen top), that is still a **crop, never a stretch**: take a window
+of the band's aspect (e.g. 1080:840) sized/positioned head-safe, then scale. Verify
+head-safety on the RENDERED output for ANY layout (circle OR band): reel-1 circle →
+`scripts/multi-aroll-crop-check.mjs`; Remotion band → `scripts/reel2-crop-check.mjs`.
+
 ## Source of truth in code
 
 `scripts/multi-aroll-stage3-4.mjs` → `calculateSquareCrop()` is the single
-implementation of this rule. Both the circle and stacked paths consume its
-output. Do not reintroduce band-stretching crop math.
+implementation for the circle/stack square. The Remotion band variant is
+`calculateBandCrop()` in `scripts/reel2-build-act1.mjs` (same head-safe intent,
+band aspect). Do not reintroduce band-STRETCHING crop math.

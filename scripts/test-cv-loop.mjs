@@ -211,8 +211,10 @@ function buildFilterComplexFromPlan(plan, template, arollSrcW, arollSrcH) {
       filters.push(`[${branch.label}_src]scale=${scaledW}:${scaledH},crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}_raw]`);
       filters.push(`[${branch.label}_raw]format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(pow(X-${cx},2)+pow(Y-${cy},2),pow(${radius},2)),255,0)'[${branch.label}]`);
     } else {
-      const fc = computeFaceCrop(targetW, targetH, faceCenter.x, faceCenter.y, arollSrcW, arollSrcH);
-      filters.push(`[${branch.label}_src]scale=${fc.scaledW}:${fc.scaledH},crop=${targetW}:${targetH}:${fc.cropX}:${fc.cropY},setsar=1[${branch.label}]`);
+      // Rectangle A-roll: scale-to-fit (NO face zoom).
+      // computeFaceCrop() over-zooms by 54% when face is off-center.
+      // Simple scale-to-fit matches the reference video's framing exactly.
+      filters.push(`[${branch.label}_src]scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH},setsar=1[${branch.label}]`);
     }
   }
 
