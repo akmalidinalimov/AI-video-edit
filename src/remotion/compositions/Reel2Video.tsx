@@ -3,6 +3,7 @@ import {
   AbsoluteFill, Sequence, Audio, Video, OffthreadVideo,
   useCurrentFrame, useVideoConfig, interpolate, spring, getRemotionEnvironment, staticFile,
 } from "remotion";
+import { Act2NodeEditor } from "./Act2NodeEditor";
 
 /** Resolve a relative public/ path to a Remotion staticFile URL; pass http/absolute through. */
 const rsrc = (s?: string) => (!s ? s : (s.startsWith("http") || s.startsWith("/") || s.includes("://")) ? s : staticFile(s));
@@ -22,12 +23,15 @@ const rsrc = (s?: string) => (!s ? s : (s.startsWith("http") || s.startsWith("/"
 // used the HTML5 <Video> during render, which seeks per frame and emits ONE black frame at each
 // clip's first frame (the cut "glitch"). OffthreadVideo extracts the exact frame via ffmpeg (no
 // seek-black) and — since Remotion 4.x — renders audio too (volume/toneFrequency/audioStreamIndex
-// props), so the top A-roll dialogue is preserved.
-const VideoTag = OffthreadVideo;
+// props), so the top A-roll dialogue is preserved. Generous delayRender timeout (vs the 28s
+// default) keeps renders reliable when multiple clips fetch from the proxy at once.
+const VideoTag: React.FC<React.ComponentProps<typeof OffthreadVideo>> = (p) => (
+  <OffthreadVideo delayRenderTimeoutInMilliseconds={120000} {...p} />
+);
 
 export interface Reel2Segment {
   startFrame: number; endFrame: number;
-  kind: "split" | "tutorial";
+  kind: "split" | "tutorial" | "nodeEditor";
   // split (Act 1)
   topSrc?: string; topLabel?: string;          // A-roll, pre-cropped to ~1080×840
   topFromSec?: number;                          // seek into the A-roll source (variety)
@@ -148,6 +152,15 @@ const SegmentView: React.FC<{ seg: Reel2Segment; index: number }> = ({ seg, inde
           {seg.bottomSrc && <VideoTag src={rsrc(seg.bottomSrc)} startFrom={Math.round((seg.bottomFromSec ?? 0) * fps)} muted style={fitCover} />}
         </div>
         {seg.bottomLabel && <PillLabel text={seg.bottomLabel} y={BOTTOM_Y + 24} />}
+      </AbsoluteFill>
+    );
+  }
+
+  // node-editor "how it's made" (Act 2 — replicates the reference's node-editor screencast)
+  if (seg.kind === "nodeEditor") {
+    return (
+      <AbsoluteFill style={{ opacity: fadeIn }}>
+        <Act2NodeEditor cta={seg.cta} />
       </AbsoluteFill>
     );
   }

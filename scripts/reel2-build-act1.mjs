@@ -340,10 +340,10 @@ function doTrim() {
 // Act-2 ("how it's made"), defined explicitly so a full rebuild reproduces it (no dependency on
 // the previous gitignored props): an EXPLAINER segment (animated StepFlow + talking Bob, audio ON,
 // one-shot) sized to the Bob clip (~10.04s), then a CTA. `frames` becomes start/end after Act-1.
+// Act-2 = the node-editor "how it's made" screencast (replicates IMG_6298 24s→end), one segment
+// internally choreographed in Act2NodeEditor.tsx to Bob's ~10s narration + a CTA hold (~14s total).
 const ACT2 = [
-  { kind: "tutorial", node: true, presenterSrc: "uploads/gen/reel2/bob-explainer.mp4",
-    presenterMuted: false, presenterLoop: false, frames: 305 },   // ~10.17s — fully contains Bob's 10.04s narration
-  { kind: "tutorial", node: true, cta: "Comment \"AI\"", frames: 90 }, // 3s CTA over the completed step-flow
+  { kind: "nodeEditor", cta: "Comment \"AI\"", frames: 420 },
 ];
 
 function buildProps(manifest) {
