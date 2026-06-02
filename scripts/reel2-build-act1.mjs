@@ -343,7 +343,7 @@ function doTrim() {
 // Act-2 = the node-editor "how it's made" screencast (replicates IMG_6298 24s→end), one segment
 // internally choreographed in Act2NodeEditor.tsx to Bob's ~10s narration + a CTA hold (~14s total).
 const ACT2 = [
-  { kind: "nodeEditor", cta: "Comment \"AI\"", frames: 420 },
+  { kind: "nodeEditor", cta: "Comment \"AI\"", frames: 490 }, // ~16.3s cinematic node-editor (orbit + L→R camera + zoom-out + CTA)
 ];
 
 function buildProps(manifest) {
