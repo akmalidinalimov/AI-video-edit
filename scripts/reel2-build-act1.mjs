@@ -337,29 +337,32 @@ function doTrim() {
 }
 
 // ════════════════════════════════════════════════════════ PROPS
-function buildProps(manifest) {
-  // preserve Act-2 (tutorial) segments from existing props; shift them after new Act-1
-  const prev = fs.existsSync(PROPS_PATH) ? JSON.parse(fs.readFileSync(PROPS_PATH, "utf-8")) : null;
-  const act2 = prev ? prev.segments.filter(s => s.kind === "tutorial") : [];
+// Act-2 ("how it's made"), defined explicitly so a full rebuild reproduces it (no dependency on
+// the previous gitignored props): an EXPLAINER segment (animated StepFlow + talking Bob, audio ON,
+// one-shot) sized to the Bob clip (~10.04s), then a CTA. `frames` becomes start/end after Act-1.
+const ACT2 = [
+  { kind: "tutorial", node: true, presenterSrc: "uploads/gen/reel2/bob-explainer.mp4",
+    presenterMuted: false, presenterLoop: false, frames: 305 },   // ~10.17s — fully contains Bob's 10.04s narration
+  { kind: "tutorial", node: true, cta: "Comment \"AI\"", frames: 90 }, // 3s CTA over the completed step-flow
+];
 
+function buildProps(manifest) {
+  const prev = fs.existsSync(PROPS_PATH) ? JSON.parse(fs.readFileSync(PROPS_PATH, "utf-8")) : null;
   const segments = [];
   let f = 0;
   for (const turn of manifest) {
-    const startFrame = f;
-    const endFrame = f + turn.frames;
     segments.push({
-      startFrame, endFrame, kind: "split",
+      startFrame: f, endFrame: f + turn.frames, kind: "split",
       topSrc: turn.topSrc, topLabel: "Real Video",
       bottomSrc: turn.bottomSrc, bottomFromSec: 0,
       bottomLabel: turn.char === "bob" ? "Bob — AI (Wan 2.7)" : "Zig — AI (Wan 2.7)",
     });
-    f = endFrame;
+    f += turn.frames;
   }
-  // append Act-2, preserving each tutorial segment's duration, starting at new Act-1 end
-  for (const seg of act2) {
-    const dur = seg.endFrame - seg.startFrame;
-    segments.push({ ...seg, startFrame: f, endFrame: f + dur });
-    f += dur;
+  for (const seg of ACT2) {
+    const { frames, ...rest } = seg;
+    segments.push({ startFrame: f, endFrame: f + frames, ...rest });
+    f += frames;
   }
 
   const props = {
@@ -368,7 +371,7 @@ function buildProps(manifest) {
     segments,
   };
   fs.writeFileSync(PROPS_PATH, JSON.stringify(props, null, 2));
-  console.log(`  props: ${PROPS_PATH} (Act-1 ${manifest.length} turns + Act-2 ${act2.length} seg, ${f} frames total)`);
+  console.log(`  props: ${PROPS_PATH} (Act-1 ${manifest.length} turns + Act-2 ${ACT2.length} seg, ${f} frames total)`);
 }
 
 // ════════════════════════════════════════════════════════ BOUNDARY GUARD
@@ -464,6 +467,13 @@ async function main() {
   const only = args.filter(a => !a.startsWith("--force"));
   const run = (flag) => only.length === 0 || only.includes(flag);
 
+  // --props: fast rebuild of reel2-props.json from the existing manifest (no re-cut of Act-1).
+  if (only.includes("--props")) {
+    console.log("=== PROPS (rebuild from manifest, no re-cut) ===");
+    buildProps(JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf-8")).turns);
+    console.log("\nDONE.");
+    return;
+  }
   if (run("--transcribe")) await doTranscribe(force);
   if (run("--align")) doAlign();
   if (run("--trim")) doTrim();
