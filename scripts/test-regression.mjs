@@ -14,6 +14,13 @@
  *   0 = all checks pass
  *   1 = regression detected (details printed)
  *
+ * SCOPE: this suite is STRUCTURAL (+ a few render checks via --full) for the FFmpeg
+ * pipeline. The render-based A-ROLL gates — word completeness, head-safe crop, no
+ * black-flash at cuts, output transcript — are the closed loop's job and MUST be run
+ * before presenting ANY A-roll edit (any render path). See the "A-ROLL DEFINITION OF
+ * DONE" checklist in docs/aroll-pipeline.md. FFmpeg circle-PIP: multi-aroll-closed-loop.mjs.
+ * Remotion split-screen: reel2-crop-check.mjs + reel2-cut-check.mjs + reel2-transcribe.mjs.
+ *
  * ══════════════════════════════════════════════════════════════
  * ADDING A NEW CHECK:
  * When you fix a bug, add a check function to the appropriate
@@ -29,6 +36,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
+import { validateDirective } from "./lib/broll/contract.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -672,9 +680,126 @@ function check_multiaroll_crop_headsafe() {
   return { pass: false, details: violations.join("\n     ") };
 }
 
+// MA6 — content-aware B-roll plan covers every segment with an in-bounds window.
+// Guards the content-aware B-roll (per-segment background) from silently reverting
+// to one static window or going stale: every timeline segment must appear in the
+// plan, and each circle segment's brollStartSec must sit inside the b-roll source.
+function check_multiaroll_broll_plan() {
+  const PLAN = path.join(ROOT, "public/exports/multi-aroll/stage2/broll-plan.json");
+  const TL = path.join(ROOT, "public/exports/multi-aroll/stage2/clean-timeline.json");
+  if (!fs.existsSync(PLAN)) return { pass: true, details: "No broll-plan.json (static B-roll — skipped)" };
+  const plan = maLoad(PLAN), tl = maLoad(TL);
+  if (!plan || !tl) return { pass: true, details: "Plan/timeline unreadable (skipped)" };
+  const nSeg = tl.segments.length;
+  const violations = [];
+  for (let i = 0; i < nSeg; i++) {
+    const p = plan.segments.find(s => s.seg === i);
+    if (!p) { violations.push(`seg${i} missing from plan`); continue; }
+    if (p.broll === null) continue; // hook: legitimately no b-roll
+    // Ordered generated BEATS (B-roll generation system): each beat clip must exist on disk.
+    if (Array.isArray(p.beats) && p.beats.length) {
+      for (const b of p.beats) {
+        if (!b.source) violations.push(`seg${i} beat (order ${b.order}) has no source`);
+        else if (!fs.existsSync(path.join(ROOT, b.source))) violations.push(`seg${i} beat ${b.source} missing on disk`);
+      }
+      continue;
+    }
+    if (p.brollStartSec == null) { violations.push(`seg${i} has no brollStartSec`); continue; }
+    // A generated (B4) source must exist on disk; a main-B-roll window must be in-bounds.
+    if (p.source) {
+      if (!fs.existsSync(path.join(ROOT, p.source))) violations.push(`seg${i} source ${p.source} missing on disk`);
+    } else {
+      const dur = plan.brollDuration ?? 0;
+      if (dur && p.brollStartSec >= dur) violations.push(`seg${i} brollStartSec ${p.brollStartSec} >= b-roll dur ${dur}`);
+    }
+  }
+  if (violations.length === 0) return { pass: true, details: `${nSeg} segments covered; windows in-bounds (dur ${plan.brollDuration}s)` };
+  return { pass: false, details: violations.join("\n     ") };
+}
+
+// MA8 — content-aware B-roll generation manifest validates against the CONTRACT.
+// Guards the isolation boundary: every directive a strategy emitted must have a valid
+// contentType and well-formed beats (order + kind; generated beats need model + prompt).
+function check_multiaroll_broll_contract() {
+  const MAN = path.join(ROOT, "public/exports/multi-aroll/stage2/broll-gen-manifest.json");
+  if (!fs.existsSync(MAN)) return { pass: true, details: "No generation manifest (skipped)" };
+  const m = maLoad(MAN);
+  if (!m || !Array.isArray(m.segments)) return { pass: true, details: "Manifest unreadable (skipped)" };
+  const violations = [];
+  for (const sg of m.segments) {
+    const v = validateDirective({ contentType: sg.contentType, beats: sg.beats });
+    if (!v.ok) violations.push(`seg${sg.seg}: ${v.errors.join("; ")}`);
+  }
+  if (violations.length === 0) return { pass: true, details: `${m.segments.length} directive(s) valid against the contract` };
+  return { pass: false, details: violations.join("\n     ") };
+}
+
 // ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+// REEL-2 (Remotion) GATES — encoded from the 2026-06-03 session where the
+// style-director loop SILENCED a talking turn (t3) and zoom-cropped it while the
+// frame-only fidelity score went UP. The frame score is BLIND to audio and to
+// per-frame head-safety. See docs/cropping-rules.md + docs/aroll-pipeline.md.
+// ══════════════════════════════════════════════════════════════
+
+// CHECK: the per-segment audio-continuity gate exists AND is wired into the
+// style-director verify loop. Bug: the loop scored frames only and shipped a
+// silent dialogue turn as "improved". Fix: scripts/reel2-audio-check.mjs + HARD GATE.
+function check_reel2_audio_gate_wired() {
+  const gate = path.join(ROOT, "scripts/reel2-audio-check.mjs");
+  if (!fs.existsSync(gate)) return { pass: false, details: "scripts/reel2-audio-check.mjs missing — the audio-continuity gate was removed" };
+  const wf = path.join(ROOT, "scripts/workflows/style-director.workflow.mjs");
+  if (fs.existsSync(wf) && !fs.readFileSync(wf, "utf8").includes("reel2-audio-check")) {
+    return { pass: false, details: "style-director.workflow.mjs no longer runs reel2-audio-check — audio gate not wired into verify" };
+  }
+  return { pass: true, details: "audio-continuity gate present + wired into the orchestrator verify loop" };
+}
+
+// CHECK: cutTop's letterbox branch maps audio. Bug: the -filter_complex letterbox path
+// had no -map 0:a, so ffmpeg dropped audio on the only close-subject (letterbox) turn.
+function check_reel2_letterbox_audio_map() {
+  const f = path.join(ROOT, "scripts/reel2-build-act1.mjs");
+  if (!fs.existsSync(f)) return { pass: true, details: "reel2-build-act1.mjs absent (skipped)" };
+  const src = fs.readFileSync(f, "utf8");
+  if (src.includes("filter_complex") && !src.includes("0:a")) {
+    return { pass: false, details: "cutTop uses -filter_complex but never maps 0:a — letterbox turns will lose audio (the t3 bug)" };
+  }
+  return { pass: true, details: "letterbox crop maps the source audio (-map 0:a)" };
+}
+
+// CHECK: calculateBandCrop sizes the band from the lean-in MOTION ENVELOPE, not a fixed
+// zoom target. Bug: a fixed FACE_FRAC_TARGET zoom-out shrank a turn + added a big
+// pillarbox (inconsistent framing). Fix: per-frame crown/chin extremes → minimal cropH.
+function check_reel2_crop_motion_envelope() {
+  const f = path.join(ROOT, "scripts/reel2-build-act1.mjs");
+  if (!fs.existsSync(f)) return { pass: true, details: "reel2-build-act1.mjs absent (skipped)" };
+  const src = fs.readFileSync(f, "utf8");
+  if (!(src.includes("crownMinY") && src.includes("chinMaxY"))) {
+    return { pass: false, details: "calculateBandCrop/detectFace no longer use the lean-in motion envelope (crownMinY/chinMaxY) — band sizing may revert to the fixed-zoom over-correction" };
+  }
+  return { pass: true, details: "band crop sizes from the lean-in motion envelope (full-bleed preferred, minimal letterbox)" };
+}
+
+// CHECK: the motion-library render-test exists AND its probe comp is registered. Step B of
+// docs/NEXT-SESSION-HANDOFF.md added MotionLibraryProbe + scripts/motion-library-check.mjs to
+// prove the 16 motion-library patterns render (no error/black frame) on the Remotion path.
+// Rule: both must exist OR the render-test for the motion library has silently been dropped.
+function check_reel2_motion_probe() {
+  const checker = path.join(ROOT, "scripts/motion-library-check.mjs");
+  if (!fs.existsSync(checker)) {
+    return { pass: false, details: "scripts/motion-library-check.mjs missing — the motion-library render-test was removed" };
+  }
+  const root = path.join(ROOT, "src/remotion/Root.tsx");
+  if (!fs.existsSync(root)) return { pass: true, details: "Root.tsx absent (skipped)" };
+  const src = fs.readFileSync(root, "utf8");
+  if (!src.includes('id="MotionLibraryProbe"')) {
+    return { pass: false, details: "MotionLibraryProbe is not registered in src/remotion/Root.tsx — the probe comp can't be rendered" };
+  }
+  return { pass: true, details: "MotionLibraryProbe registered + motion-library-check.mjs present" };
+}
 
 async function main() {
   console.log("╔══════════════════════════════════════════════════════════╗");
@@ -752,6 +877,36 @@ async function main() {
   record(
     "Multi-aroll: crop target is head-safe (top gap)",
     ...Object.values(check_multiaroll_crop_headsafe())
+  );
+
+  record(
+    "Multi-aroll: content-aware B-roll plan covers every segment",
+    ...Object.values(check_multiaroll_broll_plan())
+  );
+
+  record(
+    "Multi-aroll: B-roll generation manifest valid against the contract",
+    ...Object.values(check_multiaroll_broll_contract())
+  );
+
+  record(
+    "Reel-2: audio-continuity gate present + wired into the orchestrator",
+    ...Object.values(check_reel2_audio_gate_wired())
+  );
+
+  record(
+    "Reel-2: letterbox crop maps audio (no silent turn)",
+    ...Object.values(check_reel2_letterbox_audio_map())
+  );
+
+  record(
+    "Reel-2: band crop uses the lean-in motion envelope (no fixed-zoom pillarbox)",
+    ...Object.values(check_reel2_crop_motion_envelope())
+  );
+
+  record(
+    "Reel-2: MotionLibraryProbe registered + motion-library-check present (Step B)",
+    ...Object.values(check_reel2_motion_probe())
   );
 
   // ── Layer 2: Full Verification ──

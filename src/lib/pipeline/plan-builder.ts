@@ -1086,19 +1086,33 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     mergedRanges[0].start = 0;
   }
 
-  // ── Step 4: Close gaps between adjacent ranges ──
-  console.log("\n  Step 3: Closing gaps between ranges...");
+  // ── Step 4: Close gaps AND resolve overlaps between adjacent ranges ──
+  // RULE: Layout transitions MUST snap to sentence boundaries.
+  // When sentences overlap, the CURRENT sentence's end takes priority —
+  // the next range starts after the current sentence finishes speaking.
+  // This prevents mid-sentence layout changes (PIP position jumps while
+  // the speaker is mid-word).
+  console.log("\n  Step 3: Closing gaps / resolving overlaps between ranges...");
 
   for (let i = 0; i < mergedRanges.length - 1; i++) {
     const curr = mergedRanges[i];
     const next = mergedRanges[i + 1];
     const gap = next.start - curr.end;
     if (gap > 0 && gap < 2.0) {
+      // Gap: extend current range to meet the next
       console.log(
         `    Closing ${gap.toFixed(3)}s gap: extending '${curr.layoutId}' ` +
         `end ${curr.end.toFixed(2)}→${next.start.toFixed(2)}s`
       );
       curr.end = next.start;
+    } else if (gap < 0) {
+      // Overlap: push next range's start to current range's end
+      // (current sentence finishes before next layout starts)
+      console.log(
+        `    Resolving ${(-gap).toFixed(3)}s overlap: pushing '${next.layoutId}' ` +
+        `start ${next.start.toFixed(2)}→${curr.end.toFixed(2)}s (sentence boundary rule)`
+      );
+      next.start = curr.end;
     }
   }
 
@@ -1109,15 +1123,19 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
   }
 
   // ── Step 5: Frame-align all boundaries ──
+  // After alignment, enforce: next.start = curr.end (not the reverse!)
+  // This preserves the sentence-boundary rule from Step 4: the current
+  // sentence's aligned end becomes the authoritative transition point.
   console.log("\n  Step 4: Frame-aligning boundaries...");
 
   for (const r of mergedRanges) {
     r.start = alignToFrame(r.start, fps);
     r.end = alignToFrame(r.end, fps);
   }
-  // Ensure adjacent ranges share exact boundary
+  // Ensure adjacent ranges share exact boundary by pushing NEXT start
+  // to match CURRENT end (preserves sentence-boundary alignment)
   for (let i = 0; i < mergedRanges.length - 1; i++) {
-    mergedRanges[i].end = mergedRanges[i + 1].start;
+    mergedRanges[i + 1].start = mergedRanges[i].end;
   }
 
   // ── Step 6: Build layout ranges with enable expressions ──

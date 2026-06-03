@@ -424,20 +424,25 @@ function buildPlan(template, bpSegments, transcriptionData) {
   }
   if (merged[0].start > 0) merged[0].start = 0;
 
-  // Step 3: Close gaps
-  console.log("\n  Step 3: Closing gaps...");
+  // Step 3: Close gaps AND resolve overlaps
+  // RULE: Layout transitions MUST snap to sentence boundaries.
+  // When sentences overlap, push NEXT start to CURRENT end (not reverse).
+  console.log("\n  Step 3: Closing gaps / resolving overlaps...");
   for (let i = 0; i < merged.length - 1; i++) {
     const gap = merged[i + 1].start - merged[i].end;
     if (gap > 0 && gap < 2) {
       console.log(`    Closing ${gap.toFixed(3)}s gap`);
       merged[i].end = merged[i + 1].start;
+    } else if (gap < 0) {
+      console.log(`    Resolving ${(-gap).toFixed(3)}s overlap: pushing next start ${merged[i+1].start.toFixed(2)}→${merged[i].end.toFixed(2)}s`);
+      merged[i + 1].start = merged[i].end;
     }
   }
   merged[merged.length - 1].end += 0.5;
 
-  // Step 4: Frame-align
+  // Step 4: Frame-align, then push NEXT start to match CURRENT end
   for (const r of merged) { r.start = alignToFrame(r.start); r.end = alignToFrame(r.end); }
-  for (let i = 0; i < merged.length - 1; i++) { merged[i].end = merged[i + 1].start; }
+  for (let i = 0; i < merged.length - 1; i++) { merged[i + 1].start = merged[i].end; }
 
   // Step 5: Build ranges + enable expressions
   console.log("\n  Step 4: Enable expressions...");
@@ -546,12 +551,12 @@ const template = generateTemplate(
 // Step 2: Build plan using generated template + A-roll transcription
 const { plan } = buildPlan(template, bpData.reference.segments, transcription);
 
-// Step 2b: Per-segment circle positions
-// The template averages all circle positions into one, but the reference has
-// different circle positions per segment. Split circle ranges into per-sentence
-// sub-ranges, each with its own layout variant using the actual blueprint position.
+// Step 2b: Unified circle position + per-sentence time ranges
+// S1 APPROACH: ALL circle segments use ONE fixed position (median of CV measurements).
+// This eliminates circle jumping between sentences while still splitting time ranges
+// at sentence boundaries for clean transitions.
 console.log("\n╔══════════════════════════════════════════════════╗");
-console.log("║     PER-SEGMENT CIRCLE POSITIONS                 ║");
+console.log("║     UNIFIED CIRCLE POSITION (S1)                 ║");
 console.log("╚══════════════════════════════════════════════════╝\n");
 
 const circleLayoutIds = Object.keys(template.layouts).filter(
@@ -559,15 +564,48 @@ const circleLayoutIds = Object.keys(template.layouts).filter(
 );
 
 if (circleLayoutIds.length > 0) {
-  // Build segment lookup: sentence index → blueprint segment with per-segment bbox
-  const segLookup = new Map();
-  for (const seg of bpData.reference.segments) {
-    if (seg.aroll?.shape === "circle" && seg.aroll.boundingBox) {
-      segLookup.set(seg.id, seg);
-    }
+  // Compute UNIFIED circle position: median of all blueprint circle bounding boxes
+  const circleSegs = bpData.reference.segments.filter(
+    seg => seg.aroll?.shape === "circle" && seg.aroll.boundingBox
+  );
+
+  const median = arr => {
+    if (arr.length === 0) return 0;
+    const s = [...arr].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
+  };
+
+  let unifiedCircle;
+  if (circleSegs.length > 0) {
+    const bboxes = circleSegs.map(s => s.aroll.boundingBox);
+    const cxValues = bboxes.map(b => b.x + b.width / 2);
+    const cyValues = bboxes.map(b => b.y + b.height / 2);
+    const rValues = bboxes.map(b => Math.round(Math.min(b.width, b.height) / 2));
+
+    unifiedCircle = {
+      cx: median(cxValues),
+      cy: median(cyValues),
+      radius: median(rValues),
+    };
+    console.log(`  Unified circle: cx=${unifiedCircle.cx}, cy=${unifiedCircle.cy}, r=${unifiedCircle.radius}`);
+    console.log(`  (from ${circleSegs.length} blueprint segments: cx=[${cxValues}], cy=[${cyValues}], r=[${rValues}])`);
+  } else {
+    // Fallback: use the base template's circle layout
+    const baseCircle = template.layouts[circleLayoutIds[0]].aroll.circle;
+    unifiedCircle = { ...baseCircle };
+    console.log(`  Unified circle (from template): cx=${unifiedCircle.cx}, cy=${unifiedCircle.cy}, r=${unifiedCircle.radius}`);
   }
 
-  // Find circle ranges with multiple sentences
+  const unifiedRegion = {
+    x: unifiedCircle.cx - unifiedCircle.radius,
+    y: unifiedCircle.cy - unifiedCircle.radius,
+    width: unifiedCircle.radius * 2,
+    height: unifiedCircle.radius * 2,
+  };
+
+  // Find circle ranges with multiple sentences → split into per-sentence time ranges
+  // but ALL use the SAME unified circle position
   const newRanges = [];
   let rangeNum = 1;
 
@@ -581,43 +619,27 @@ if (circleLayoutIds.length > 0) {
 
     console.log(`  Splitting ${range.id} (${range.sentences.length} sentences) into per-sentence ranges...`);
 
-    // Create per-sentence sub-ranges
+    // Create per-sentence sub-ranges with UNIFIED circle position
     for (let si = 0; si < range.sentences.length; si++) {
       const sentence = range.sentences[si];
       const isFirst = si === 0;
       const isLastSentence = si === range.sentences.length - 1;
 
       // Time range: sentence boundaries, but first/last align to original range
+      // RULE: Use CURRENT sentence's end as the boundary, not next sentence's
+      // start. This prevents mid-sentence transitions when sentences overlap.
       const subStart = isFirst ? range.timeRange.start : alignToFrame(sentence.start);
-      const subEnd = isLastSentence ? range.timeRange.end : alignToFrame(range.sentences[si + 1].start);
+      const subEnd = isLastSentence ? range.timeRange.end : alignToFrame(sentence.end);
 
-      // Find matching blueprint segment by time overlap
-      let bestSeg = null;
-      let bestOverlap = 0;
-      for (const seg of bpData.reference.segments) {
-        if (seg.aroll?.shape !== "circle" || !seg.aroll.boundingBox) continue;
-        const oStart = Math.max(seg.start, sentence.start);
-        const oEnd = Math.min(seg.end, sentence.end);
-        const overlap = Math.max(0, oEnd - oStart);
-        if (overlap > bestOverlap) { bestOverlap = overlap; bestSeg = seg; }
-      }
-
-      // Create per-sentence layout variant with this segment's exact bbox
+      // ALL sub-ranges use the SAME unified circle position (S1 approach)
       const perSentenceLayoutId = `${range.layoutId}_s${sentence.index + 1}`;
-      const bbox = bestSeg?.aroll?.boundingBox ?? baseLayout.aroll.region;
-      const radius = Math.min(bbox.width, bbox.height) / 2;
-      const circleDef = {
-        cx: bbox.x + bbox.width / 2,
-        cy: bbox.y + bbox.height / 2,
-        radius: Math.round(radius),
-      };
 
       template.layouts[perSentenceLayoutId] = {
         id: perSentenceLayoutId,
         aroll: {
-          region: { x: bbox.x, y: bbox.y, width: bbox.width, height: bbox.height },
+          region: { ...unifiedRegion },
           shape: "circle",
-          circle: circleDef,
+          circle: { ...unifiedCircle },
           border: baseLayout.aroll.border,
           faceCropCenter: baseLayout.aroll.faceCropCenter,
         },
@@ -631,8 +653,7 @@ if (circleLayoutIds.length > 0) {
       const isLast = isLastSentence && range === plan.layoutRanges[plan.layoutRanges.length - 1];
       const enableExpr = buildEnableExpr(sf, ef, isLast);
 
-      const cx = circleDef.cx, cy = circleDef.cy, r = circleDef.radius;
-      console.log(`    S${sentence.index + 1}: ${perSentenceLayoutId} (${subStart.toFixed(2)}-${subEnd.toFixed(2)}s) circle=(${cx},${cy}) r=${r}`);
+      console.log(`    S${sentence.index + 1}: ${perSentenceLayoutId} (${subStart.toFixed(2)}-${subEnd.toFixed(2)}s) circle=(${unifiedCircle.cx},${unifiedCircle.cy}) r=${unifiedCircle.radius}`);
 
       newRanges.push({
         id: `range_${rangeNum++}`,
@@ -640,7 +661,7 @@ if (circleLayoutIds.length > 0) {
         timeRange: { start: subStart, end: subEnd },
         sentences: [sentence],
         textOverlays: [],
-        reasoning: `Per-segment circle position from blueprint (${bestSeg?.id ?? 'unknown'})`,
+        reasoning: `Unified circle position (S1 approach)`,
         startFrame: sf,
         endFrame: ef,
         enableExpr,
@@ -650,6 +671,23 @@ if (circleLayoutIds.length > 0) {
 
   // Replace plan ranges
   plan.layoutRanges = newRanges;
+
+  // Post-split contiguity pass: ensure adjacent ranges share exact boundaries.
+  // After using sentence.end (not next.start) for boundaries, small gaps or
+  // overlaps can appear. Fix by pushing next.start = curr.end.
+  for (let i = 0; i < plan.layoutRanges.length - 1; i++) {
+    const curr = plan.layoutRanges[i];
+    const next = plan.layoutRanges[i + 1];
+    if (Math.abs(next.timeRange.start - curr.timeRange.end) > 0.001) {
+      next.timeRange.start = curr.timeRange.end;
+      const sf = Math.round(next.timeRange.start * FPS);
+      const ef = Math.round(next.timeRange.end * FPS);
+      const isLast = i + 1 === plan.layoutRanges.length - 1;
+      next.startFrame = sf;
+      next.endFrame = ef;
+      next.enableExpr = buildEnableExpr(sf, ef, isLast);
+    }
+  }
 
   // Rebuild transitions
   plan.transitions = [];

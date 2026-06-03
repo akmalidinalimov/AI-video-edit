@@ -18,7 +18,11 @@ rule, encoded from the user's diagram `docs/cropping-rules.png`) and
 `docs/editing-craft.md` (framing, stacking, pacing). Core rule: always crop the
 talking person to a 1:1 SQUARE (head + shoulders, ~90% fill, small top gap, no
 default zoom), then place per the reference layout (circle mask, or top/bottom
-stack with B-roll). Never stretch a portrait/landscape source into a band.
+stack with B-roll). Never STRETCH a portrait/landscape source into a band. If the
+reference layout genuinely uses a wide band for the talking head (e.g. reel-2's
+split-screen top), CROP it head-safe (detect the face, take a band-aspect window,
+scale — never stretch): **position by FACE-BOX CENTER** so a lean can't clip the
+chin, and verify head-safety on the RENDERED output for ANY layout (circle or band).
 
 ## A-roll editing — the GENERAL process (read first)
 
@@ -50,6 +54,28 @@ Gates (never present unless all pass): word completeness 100% (each segment keep
 its intended sentence COMPLETE — no cut/overlap), no boundary dead-air, crop
 head-safety (top gap + head&shoulders, every sampled frame), no blank circle,
 boundary-guard (output re-transcription confirms first/last word of each segment).
+
+**The gates are pipeline-AGNOSTIC — see the "A-ROLL DEFINITION OF DONE" checklist at
+the top of `docs/aroll-pipeline.md`.** The command above is the FFmpeg circle-PIP
+closed loop. A DIFFERENT render path (e.g. reel-2's **Remotion** split-screen,
+`src/remotion/compositions/Reel2Video.tsx`) needs the SAME gates wired with its own
+tools — they do NOT transfer for free:
+- Head-safe crop → `node scripts/reel2-crop-check.mjs` (YuNet on the rendered band; band sizing
+  must use the lean-in MOTION ENVELOPE — full-bleed preferred, letterbox a minimal last resort)
+- No black-flash at cuts → `node scripts/reel2-cut-check.mjs` (brightness dip at any
+  boundary; Remotion: use `OffthreadVideo` everywhere + fade only the first segment)
+- Audio continuity (no SILENT talking segment) → `node scripts/reel2-audio-check.mjs` (per-segment
+  `volumedetect`; the frame/style score is BLIND to audio — it rises even while a turn is silent)
+- Output transcript (words complete, in order, no overlap) → `node scripts/reel2-transcribe.mjs <mp4>`
+
+**Never re-encode/overwrite a source clip in `public/uploads/**` in place** — do crop/zoom/grade IN the
+composition; an in-place `-filter_complex` re-encode silently drops audio and there's no undo (gitignored).
+Repair one turn with `node scripts/reel2-build-act1.mjs --recut-top <t>`. See `docs/cropping-rules.md`.
+
+**META-RULE:** a new A-roll render path starts with ZERO gates — wire EVERY item on the
+Definition of Done before presenting. The 3 reel-2 iterations (clipped words → cropped
+head → black-flash), plus the 2026-06-03 round (silent turn → fixed-zoom pillarbox), were each a gate
+that wasn't ported/existed yet. See `.knowledge/lessons/multi-aroll-qa.md` §13–§18.
 
 Key rules:
 - **Precise word times come from MMS FORCED ALIGNMENT**, not raw Gemini timestamps

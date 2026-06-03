@@ -29,6 +29,18 @@ const template = JSON.parse(fs.readFileSync(templatePath, "utf-8"));
 // Load clean timeline
 const timeline = JSON.parse(fs.readFileSync(path.join(STAGE2_DIR, "clean-timeline.json"), "utf-8"));
 
+// CONTENT-AWARE B-ROLL plan (optional). Maps each narrative segment to the WINDOW
+// of the B-roll source whose on-screen content best illustrates that segment's
+// speech (built by scripts/multi-aroll-broll-match.mjs — "Gemini proposes"). When
+// present, the full-canvas background SWITCHES per segment instead of playing one
+// static window. Absent → fall back to the single static B-roll (other references).
+const brollPlan = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(STAGE2_DIR, "broll-plan.json"), "utf-8"));
+  } catch { return null; }
+})();
+const BROLL_DURATION = brollPlan?.brollDuration ?? null;
+
 // Load face data for ALL clips (generic over clip count — read every contiguous
 // clip_N_face.json starting at 0).
 const faceData = {};
@@ -294,8 +306,99 @@ function buildFilterGraph(methodNum, segments) {
     }
   }
 
-  // ── B-ROLL (Input 0): Scale to full canvas ──
-  filters.push(`[0:v]setpts=PTS-STARTPTS,scale=${CANVAS_W}:${CANVAS_H}:force_original_aspect_ratio=increase,crop=${CANVAS_W}:${CANVAS_H},setsar=1[bg]`);
+  // ── B-ROLL → full-canvas background [bg] ──
+  // CONTENT-AWARE + MULTI-SOURCE: with a broll-plan, the background CONCATENATES one
+  // B-roll window per narrative segment, each pulled from THAT segment's chosen source
+  // — either a window of the main B-roll (input 0) or a dedicated GENERATED clip (a
+  // later input) when the source pool can't depict the speech (B4). We concat
+  // per-SEGMENT (not per merged A-roll run) so the B-roll changes with the narrative
+  // independently of the A-roll overlay merging. Concatenation (vs enable-switching)
+  // keeps every seam FRAME-EXACT with zero overlay-sync/pad risk. Each bgseg is forced
+  // to EXACTLY its segment's timeline duration (tpad clone-extends then trim) so a
+  // generated clip that is a hair short can never drift the timeline. No plan → static.
+  let genSources = [];
+  if (brollPlan && BROLL_DURATION) {
+    const N = ranges.length;
+    // Resolve each segment's b-roll: ordered BEATS (generated single-shot clips we
+    // concat ourselves), a single generated source, or the main B-roll (input 0).
+    const segSrc = ranges.map(r => {
+      const p = brollPlan.segments.find(s => s.seg === r.rangeIndex);
+      let beats = null, src = null;
+      if (p && Array.isArray(p.beats) && p.beats.length) {
+        beats = p.beats.filter(b => b && b.source);
+        for (const b of beats) if (!genSources.includes(b.source)) genSources.push(b.source);
+      } else if (p && p.source) {
+        src = p.source;
+        if (!genSources.includes(src)) genSources.push(src);
+      }
+      return { p, src, beats };
+    });
+    // Generated clips become FFmpeg inputs AFTER the A-roll clips (input 0 + A-roll
+    // mapping stay untouched → no A-roll/audio regression).
+    const genInputBase = 1 + clipIndices.length;
+    const genInputMap = {};
+    genSources.forEach((s, i) => { genInputMap[s] = genInputBase + i; });
+    const genDur = {};
+    for (const s of genSources) {
+      try {
+        const raw = execFileSync(FFPROBE, ["-v", "quiet", "-print_format", "json", "-show_format", path.resolve(ROOT, s)], { encoding: "utf-8" });
+        genDur[s] = parseFloat(JSON.parse(raw).format.duration);
+      } catch { genDur[s] = null; }
+    }
+    // Split the main B-roll (input 0) by how many segments draw from it.
+    const mainIdx = segSrc.map((s, i) => ((s.src || s.beats) ? -1 : i)).filter(i => i >= 0);
+    const mainLabel = {};
+    if (mainIdx.length === 1) mainLabel[mainIdx[0]] = "0:v";
+    else if (mainIdx.length > 1) {
+      filters.push(`[0:v]split=${mainIdx.length}${mainIdx.map(i => `[bmain${i}]`).join("")}`);
+      mainIdx.forEach(i => { mainLabel[i] = `bmain${i}`; });
+    }
+    // Common chain: full-canvas fit + force the clip to EXACTLY `durSec` (tpad clone
+    // then trim) so a short generated clip can never drift the timeline/seams.
+    const bgClip = (inLabel, bStart, durSec, outLabel) =>
+      `[${inLabel}]trim=start=${bStart.toFixed(4)},setpts=PTS-STARTPTS,` +
+      `scale=${CANVAS_W}:${CANVAS_H}:force_original_aspect_ratio=increase,crop=${CANVAS_W}:${CANVAS_H},` +
+      `fps=${FPS},tpad=stop_mode=clone:stop_duration=1.0,trim=duration=${durSec.toFixed(4)},` +
+      `setpts=PTS-STARTPTS,setsar=1,format=yuv420p[${outLabel}]`;
+
+    const segLabels = [];
+    for (let i = 0; i < N; i++) {
+      const r = ranges[i];
+      const segDur = r.alignedEnd - r.alignedStart;            // exact, frame-aligned
+      const segFrames = Math.round(segDur * FPS);
+      const { p, src, beats } = segSrc[i];
+
+      if (beats) {
+        // Ordered BEATS — split this segment's timeline window across its beats by SHARE,
+        // distributing FRAMES so sub-durations sum EXACTLY to segDur (no drift), then
+        // concat the single-shot beat clips → seamless hard cuts in the planned order.
+        const shares = beats.map(b => (b.durationShare > 0 ? b.durationShare : (b.durationSec > 0 ? b.durationSec : 3)));
+        const sumShares = shares.reduce((a, b) => a + b, 0);
+        let used = 0; const beatLabels = [];
+        for (let j = 0; j < beats.length; j++) {
+          const bf = (j === beats.length - 1) ? (segFrames - used) : Math.max(1, Math.round(segFrames * shares[j] / sumShares));
+          used += bf;
+          const subDur = bf / FPS;
+          const b = beats[j];
+          const srcDur = genDur[b.source] ?? subDur + 1;
+          let bStart = b.brollStartSec != null ? b.brollStartSec : 0;
+          if (bStart > Math.max(0, srcDur - 0.1)) bStart = Math.max(0, srcDur - 0.1);
+          filters.push(bgClip(`${genInputMap[b.source]}:v`, bStart, subDur, `bgseg${i}_b${j}`));
+          beatLabels.push(`[bgseg${i}_b${j}]`);
+        }
+        filters.push(`${beatLabels.join("")}concat=n=${beats.length}:v=1:a=0,setsar=1[bgseg${i}]`);
+      } else {
+        const srcDur = src ? (genDur[src] ?? segDur + 1) : BROLL_DURATION;
+        let bStart = (p && p.brollStartSec != null) ? p.brollStartSec : 0;
+        if (bStart > Math.max(0, srcDur - 0.1)) bStart = Math.max(0, srcDur - 0.1);
+        filters.push(bgClip(src ? `${genInputMap[src]}:v` : mainLabel[i], bStart, segDur, `bgseg${i}`));
+      }
+      segLabels.push(`[bgseg${i}]`);
+    }
+    filters.push(`${segLabels.join("")}concat=n=${N}:v=1:a=0,setsar=1[bg]`);
+  } else {
+    filters.push(`[0:v]setpts=PTS-STARTPTS,scale=${CANVAS_W}:${CANVAS_H}:force_original_aspect_ratio=increase,crop=${CANVAS_W}:${CANVAS_H},setsar=1[bg]`);
+  }
 
   // ── A-ROLL INPUTS: split each clip by the NUMBER OF RUNS that use it ──
   for (const ci of clipIndices) {
@@ -458,6 +561,7 @@ function buildFilterGraph(methodNum, segments) {
     filterStr: filters.join(";\n"),
     clipInputMap,
     clipIndices,
+    genSources,
     totalDuration,
   };
 }
@@ -534,7 +638,7 @@ function renderMethod(methodNum, methodName) {
   console.log(`══════════════════════════════════════════════════════\n`);
 
   const segments = timeline.segments;
-  const { filterStr, clipIndices, totalDuration } = buildFilterGraph(methodNum, segments);
+  const { filterStr, clipIndices, genSources, totalDuration } = buildFilterGraph(methodNum, segments);
   const audioFilter = buildAudioConcat(segments);
 
   const fullFilter = filterStr + ";\n" + audioFilter;
@@ -552,10 +656,15 @@ function renderMethod(methodNum, methodName) {
   // Input 0: B-roll
   args.push("-i", BROLL_PATH);
 
-  // Inputs 1..N: A-roll clips (in order of clipIndices)
+  // Inputs 1..K: A-roll clips (in order of clipIndices)
   for (const ci of clipIndices) {
     const seg = segments.find(s => s.sourceClipIndex === ci);
     args.push("-i", seg.sourceClipPath);
+  }
+
+  // Inputs K+1..: generated B-roll clips (same order buildFilterGraph assigned).
+  for (const src of (genSources || [])) {
+    args.push("-i", path.resolve(ROOT, src));
   }
 
   args.push(
