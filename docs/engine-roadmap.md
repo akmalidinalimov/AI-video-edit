@@ -4,6 +4,11 @@ The replication engine = "understand a reference video → replicate its editing
 own A-roll/B-roll." This doc is the durable handoff so any session can resume cold. (The fuller working plan
 is also at `~/.claude/plans/continue-reel-2-v3-delegated-parasol.md`, but THIS committed doc is canonical.)
 
+> **Resuming? Read [`NEXT-SESSION-HANDOFF.md`](NEXT-SESSION-HANDOFF.md)** — the step-by-step execution plan
+> + the Remotion-authoring pivot (the BUILD/translate step is the real engine; build a `remotion-author`
+> translator skill+agent, enrich it from a ~20-reel corpus). It names the agents/skills per step, the
+> find-skills+vet flow, parallel-worktree execution, and the closed-loop + watch/listen verification.
+
 ## Current maturity (honest, as of commit `88422bf`, branch `reel2-aroll-v3`)
 - ✅ **style-fidelity** (`scripts/style-fidelity.mjs`) — PROVEN. Scores output vs reference on 6 style dims +
   routable punch-list. Baseline on reel2 vs IMG_6298 = **65/100** (Act-1 78-84 match; Act-2 44-59 gap; lowest
