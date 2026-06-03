@@ -26,11 +26,14 @@ import {
 const FONT = "Inter, Arial, sans-serif";
 const MONO = "ui-monospace, Menlo, monospace";
 
-// ── Reference teal / light-blue accent palette (cool studio UI). ──
-const TEAL = "#5ec8d8";          // primary accent (teal / light-blue)
-const TEAL_SOFT = "#8fdce8";     // lighter teal
-const TEAL_DIM = "rgba(94,200,216,0.55)";
-const TEAL_LINE = "rgba(120,210,224,0.65)";   // thin outline
+// ── Reference accent palette: a PURER BLUE (not teal/cyan). style-fidelity punch-list (2026-06-03)
+//    found our teal/cyan UI accent diverged from IMG_6298's purer blue borders/progress/waveforms, and
+//    the player border glow was over-pronounced. Shifted toward blue + reduced glow alpha. (Names kept
+//    as TEAL* to avoid churn across usages — the VALUES are now blue.) ──
+const TEAL = "#5b9cf0";          // primary accent — purer blue
+const TEAL_SOFT = "#9cc3fb";     // lighter blue
+const TEAL_DIM = "rgba(91,156,240,0.50)";
+const TEAL_LINE = "rgba(124,170,245,0.55)";   // thin outline (alpha reduced → less glow)
 const TRACK_BG = "rgba(16,22,28,0.9)";
 
 const A = {

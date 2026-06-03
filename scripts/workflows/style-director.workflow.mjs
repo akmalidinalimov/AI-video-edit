@@ -128,7 +128,8 @@ let buildBrief =
   `Motion recipes: ${JSON.stringify(motionRecipes).slice(0, 4000)}\n` +
   `Edit plan: ${JSON.stringify(editPlan?.timeline || []).slice(0, 3000)}\n` +
   `Use the remotion-best-practices skill + our gotchas (OffthreadVideo w/ 120s timeout, loop short clips, fade only segment 0, NO CSS transitions, frame-aligned ranges). Compositions live in src/remotion/compositions/.\n` +
-  `GUARDRAIL — never clobber source assets: do ALL visual changes (crop, zoom, grade, reframe) IN the composition via CSS transform/objectFit/filter. NEVER re-encode or overwrite a source clip in public/uploads/** in place (they are gitignored originals WITH AUDIO — re-encoding drops the audio track and there is no undo). If you genuinely need a transformed clip on disk, write it to a NEW path and update props to point at it.`;
+  `GUARDRAIL — never clobber source assets: do ALL visual changes (crop, zoom, grade, reframe) IN the composition via CSS transform/objectFit/filter. NEVER re-encode or overwrite a source clip in public/uploads/** in place (they are gitignored originals WITH AUDIO — re-encoding drops the audio track and there is no undo). If you genuinely need a transformed clip on disk, write it to a NEW path and update props to point at it.\n` +
+  `COLOR ROUTE (where color lives — for any "color" punch-list item): the per-band color grade is GRADE_TOP / GRADE_BOTTOM (CSS \`filter\` strings) near the top of src/remotion/compositions/Reel2Video.tsx — tune saturate/brightness/contrast/hue-rotate there, or upgrade to an SVG feColorMatrix split-tone (see docs/remotion-authoring.md). The Act-2 editor-UI accent is the TEAL* constants in src/remotion/compositions/Act2NodeEditor.tsx (keep it a PURER BLUE, not cyan; keep border glow subtle). Make incremental, tasteful changes — over-grading looks garish; re-score after each.`;
 
 while (iter < MAX_ITERS) {
   iter++;
