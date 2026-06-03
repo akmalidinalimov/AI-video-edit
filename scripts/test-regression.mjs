@@ -783,6 +783,24 @@ function check_reel2_crop_motion_envelope() {
   return { pass: true, details: "band crop sizes from the lean-in motion envelope (full-bleed preferred, minimal letterbox)" };
 }
 
+// CHECK: the motion-library render-test exists AND its probe comp is registered. Step B of
+// docs/NEXT-SESSION-HANDOFF.md added MotionLibraryProbe + scripts/motion-library-check.mjs to
+// prove the 16 motion-library patterns render (no error/black frame) on the Remotion path.
+// Rule: both must exist OR the render-test for the motion library has silently been dropped.
+function check_reel2_motion_probe() {
+  const checker = path.join(ROOT, "scripts/motion-library-check.mjs");
+  if (!fs.existsSync(checker)) {
+    return { pass: false, details: "scripts/motion-library-check.mjs missing — the motion-library render-test was removed" };
+  }
+  const root = path.join(ROOT, "src/remotion/Root.tsx");
+  if (!fs.existsSync(root)) return { pass: true, details: "Root.tsx absent (skipped)" };
+  const src = fs.readFileSync(root, "utf8");
+  if (!src.includes('id="MotionLibraryProbe"')) {
+    return { pass: false, details: "MotionLibraryProbe is not registered in src/remotion/Root.tsx — the probe comp can't be rendered" };
+  }
+  return { pass: true, details: "MotionLibraryProbe registered + motion-library-check.mjs present" };
+}
+
 async function main() {
   console.log("╔══════════════════════════════════════════════════════════╗");
   console.log("║        STYLECLONE REGRESSION TEST SUITE                 ║");
@@ -884,6 +902,11 @@ async function main() {
   record(
     "Reel-2: band crop uses the lean-in motion envelope (no fixed-zoom pillarbox)",
     ...Object.values(check_reel2_crop_motion_envelope())
+  );
+
+  record(
+    "Reel-2: MotionLibraryProbe registered + motion-library-check present (Step B)",
+    ...Object.values(check_reel2_motion_probe())
   );
 
   // ── Layer 2: Full Verification ──
