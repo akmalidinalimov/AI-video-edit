@@ -27,7 +27,13 @@ defect class we have actually shipped by accident; the gate is how you catch it.
 - [ ] **Continuity at cuts — NO black/blank flash** — hard cuts are instant; no fade-from-black, no
       seek-black, no blank circle. (FFmpeg: contiguous `enable=` ranges; Remotion: `OffthreadVideo`
       everywhere + fade only the FIRST segment. Verify with a per-frame brightness probe: `cut-check`)
-- [ ] **Audio continuous, no overlap** — one speaker at a time, no dead air at a junction, no doubled voices.
+- [ ] **Audio continuous, no overlap, no SILENT segment** — one speaker at a time, no dead air at a
+      junction, no doubled voices, AND every talking segment actually carries audio (no segment whose
+      source clip lost its audio stream). The frame/style score is BLIND to audio — it will happily rise
+      while a turn is silent. Measure audio on the rendered output per segment, never assume.
+      (Remotion path: `scripts/reel2-audio-check.mjs` — per-segment `volumedetect`, fails any silent
+      talking segment, tolerates a known CTA/music-bed tail. 2026-06-03: a re-encode dropped one turn's
+      audio and the loop still scored it "improved" — this gate is why that can't ship again.)
 - [ ] **Output re-transcription clean** — transcribe the finished video: full dialogue, in order, no
       overlap, `audioIssues` empty.
 
@@ -45,7 +51,9 @@ the rendered output).
 > presenting. Reel-2's split-screen path re-discovered clipped words, a cropped head, and a black-flash
 > at cuts — each a gate reel-1 already had but that wasn't carried over. Porting a pipeline = porting all
 > its gates. The Remotion-path gate tools are `scripts/reel2-crop-check.mjs`, `scripts/reel2-cut-check.mjs`,
-> and `scripts/reel2-transcribe.mjs`; the FFmpeg-path closed loop is `scripts/multi-aroll-closed-loop.mjs`.
+> `scripts/reel2-audio-check.mjs`, and `scripts/reel2-transcribe.mjs`; the FFmpeg-path closed loop is
+> `scripts/multi-aroll-closed-loop.mjs`. (2026-06-03 added the **audio-continuity** gate after the
+> style-director loop silenced a turn while the visual score rose — a gate no render path had yet.)
 
 ## The two non-negotiables
 

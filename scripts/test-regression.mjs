@@ -738,6 +738,51 @@ function check_multiaroll_broll_contract() {
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════════════════
+// REEL-2 (Remotion) GATES — encoded from the 2026-06-03 session where the
+// style-director loop SILENCED a talking turn (t3) and zoom-cropped it while the
+// frame-only fidelity score went UP. The frame score is BLIND to audio and to
+// per-frame head-safety. See docs/cropping-rules.md + docs/aroll-pipeline.md.
+// ══════════════════════════════════════════════════════════════
+
+// CHECK: the per-segment audio-continuity gate exists AND is wired into the
+// style-director verify loop. Bug: the loop scored frames only and shipped a
+// silent dialogue turn as "improved". Fix: scripts/reel2-audio-check.mjs + HARD GATE.
+function check_reel2_audio_gate_wired() {
+  const gate = path.join(ROOT, "scripts/reel2-audio-check.mjs");
+  if (!fs.existsSync(gate)) return { pass: false, details: "scripts/reel2-audio-check.mjs missing — the audio-continuity gate was removed" };
+  const wf = path.join(ROOT, "scripts/workflows/style-director.workflow.mjs");
+  if (fs.existsSync(wf) && !fs.readFileSync(wf, "utf8").includes("reel2-audio-check")) {
+    return { pass: false, details: "style-director.workflow.mjs no longer runs reel2-audio-check — audio gate not wired into verify" };
+  }
+  return { pass: true, details: "audio-continuity gate present + wired into the orchestrator verify loop" };
+}
+
+// CHECK: cutTop's letterbox branch maps audio. Bug: the -filter_complex letterbox path
+// had no -map 0:a, so ffmpeg dropped audio on the only close-subject (letterbox) turn.
+function check_reel2_letterbox_audio_map() {
+  const f = path.join(ROOT, "scripts/reel2-build-act1.mjs");
+  if (!fs.existsSync(f)) return { pass: true, details: "reel2-build-act1.mjs absent (skipped)" };
+  const src = fs.readFileSync(f, "utf8");
+  if (src.includes("filter_complex") && !src.includes("0:a")) {
+    return { pass: false, details: "cutTop uses -filter_complex but never maps 0:a — letterbox turns will lose audio (the t3 bug)" };
+  }
+  return { pass: true, details: "letterbox crop maps the source audio (-map 0:a)" };
+}
+
+// CHECK: calculateBandCrop sizes the band from the lean-in MOTION ENVELOPE, not a fixed
+// zoom target. Bug: a fixed FACE_FRAC_TARGET zoom-out shrank a turn + added a big
+// pillarbox (inconsistent framing). Fix: per-frame crown/chin extremes → minimal cropH.
+function check_reel2_crop_motion_envelope() {
+  const f = path.join(ROOT, "scripts/reel2-build-act1.mjs");
+  if (!fs.existsSync(f)) return { pass: true, details: "reel2-build-act1.mjs absent (skipped)" };
+  const src = fs.readFileSync(f, "utf8");
+  if (!(src.includes("crownMinY") && src.includes("chinMaxY"))) {
+    return { pass: false, details: "calculateBandCrop/detectFace no longer use the lean-in motion envelope (crownMinY/chinMaxY) — band sizing may revert to the fixed-zoom over-correction" };
+  }
+  return { pass: true, details: "band crop sizes from the lean-in motion envelope (full-bleed preferred, minimal letterbox)" };
+}
+
 async function main() {
   console.log("╔══════════════════════════════════════════════════════════╗");
   console.log("║        STYLECLONE REGRESSION TEST SUITE                 ║");
@@ -824,6 +869,21 @@ async function main() {
   record(
     "Multi-aroll: B-roll generation manifest valid against the contract",
     ...Object.values(check_multiaroll_broll_contract())
+  );
+
+  record(
+    "Reel-2: audio-continuity gate present + wired into the orchestrator",
+    ...Object.values(check_reel2_audio_gate_wired())
+  );
+
+  record(
+    "Reel-2: letterbox crop maps audio (no silent turn)",
+    ...Object.values(check_reel2_letterbox_audio_map())
+  );
+
+  record(
+    "Reel-2: band crop uses the lean-in motion envelope (no fixed-zoom pillarbox)",
+    ...Object.values(check_reel2_crop_motion_envelope())
   );
 
   // ── Layer 2: Full Verification ──

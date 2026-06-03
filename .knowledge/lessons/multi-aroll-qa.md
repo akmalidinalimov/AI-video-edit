@@ -225,3 +225,31 @@ iterations; each was a reel-1 gate that wasn't carried into the new path. See [[
   checklist (`docs/aroll-pipeline.md`) before presenting — words, no-mid-word, head-safe crop, lip-sync,
   cut-continuity, audio, output transcript. NEVER present an A-roll edit that hasn't passed every gate ON
   THE RENDERED OUTPUT. "Looks fine in the plan" and "the source is clean" are not verification.
+
+## REEL-2 round 2 (2026-06-03 style-director run) — the visual score is BLIND to audio + motion
+
+## 17. A talking segment went SILENT and the frame/style score still rose — add an AUDIO gate
+- The style-director loop scored STILL FRAMES (Gemini style-fidelity) and reported 65→76 "improved"
+  while dialogue turn t3 was completely silent. Frame scoring cannot hear; it will bless a broken mix.
+- Root cause: a subagent re-cut t3's top clip to fix head-clipping, via `cutTop`'s LETTERBOX branch which
+  uses `-filter_complex`. ffmpeg disables automatic audio passthrough under `-filter_complex`, and there
+  was no `-map 0:a` → the only close-subject (letterbox) turn rendered silent. Simple `-vf` turns kept audio.
+- FIX: (1) `cutTop` letterbox branch now maps `[outv]` + `0:a?`; (2) new `scripts/reel2-audio-check.mjs`
+  per-segment `volumedetect` gate (fails any silent talking segment, tolerates the CTA/music-bed tail),
+  wired into the orchestrator verify loop as a HARD GATE; (3) regression guards added (audio gate wired +
+  letterbox maps audio). RULE: every render must pass an audio-continuity gate AND be watched/listened to —
+  never trust the visual score alone. Never overwrite a source clip in place (gitignored, no undo, drops audio).
+
+## 18. Head-safe BAND sizing must use the lean-in MOTION ENVELOPE; full-bleed > minimal letterbox
+- After restoring t3's audio, it looked "cropped": the crop algo zoomed OUT to a fixed `FACE_FRAC_TARGET=0.52`
+  for any large face → t3's face shrank to half-band + a 17%-per-side blurred pillarbox, inconsistent with the
+  full-width turns. A naive "just go full-width" fix then FAILED head-safety: t3 leans in, so the chin drops
+  past the band bottom at the extreme frame (faceBottom 1.01) even though the MEDIAN face fits.
+- Root cause: the band crop was decided on the STATIC/median face. A static face can fit while the lean-in
+  extreme clips; and a fixed zoom target over-corrects.
+- FIX: `detectFace` returns the per-frame MOTION ENVELOPE (`crownMinY` highest crown, `chinMaxY` lowest chin
+  across samples); `calculateBandCrop` sizes the window to the MINIMAL `cropH` that keeps the WHOLE envelope
+  head-safe (crown ≥0.03, chin ≤0.99) — prefers full-bleed full-width, grows to a thin letterbox only when the
+  lean-in truly needs it (t3: cropH 613 ≈ face 0.73 band, ~4% fill — vs the old 854 ≈ 0.52 + huge bars).
+  Surgical single-turn repair: `node scripts/reel2-build-act1.mjs --recut-top <t>`. RULE: size band crops from
+  the lean-in extremes, not the median; keep framing CONSISTENT across turns (one odd turn reads as a defect).

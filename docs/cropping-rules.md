@@ -113,6 +113,36 @@ of the band's aspect (e.g. 1080:840) sized/positioned head-safe, then scale. Ver
 head-safety on the RENDERED output for ANY layout (circle OR band): reel-1 circle →
 `scripts/multi-aroll-crop-check.mjs`; Remotion band → `scripts/reel2-crop-check.mjs`.
 
+## Band sizing — use the lean-in MOTION ENVELOPE, prefer FULL-BLEED, letterbox is a minimal last resort
+
+Encoded from reel-2 §13–§18 (the t3 turn, twice). For a BAND crop (not a square), three rules:
+
+1. **Size from the motion envelope, not the median face.** The speaker LEANS IN: across the turn the
+   crown rises and the chin drops. A window sized to the *median/static* face fits the median frame but
+   clips the chin at the lean-in extreme. Take the per-frame extremes — **highest crown + lowest chin**
+   across the detection samples — and size the window to the MINIMAL height that keeps that whole
+   envelope head-safe (crown gap ≥ `GAP_MIN` 0.03, face bottom ≤ `BOTTOM_MAX` 0.99). `detectFace`
+   returns `crownMinY`/`chinMaxY` from `j.samples`; `calculateBandCrop` consumes them.
+2. **Prefer FULL-BLEED full-width; letterbox only when the envelope truly can't fit, and then minimally.**
+   Do NOT zoom out to a fixed face fraction (the old `FACE_FRAC_TARGET=0.52` shrank one turn to half-size
+   and added a 17%-per-side blurred pillarbox — visibly "cropped"/inconsistent with the other turns).
+   Grow the window only as much as the lean-in requires: most turns stay full-width (no bars); a close
+   lean-in gets a *thin* (~4%) side-fill, not a heavy one. Consistency across turns matters — a single
+   turn framed differently reads as a defect.
+3. **A re-encode that uses `-filter_complex` MUST `-map 0:a` (or it silently drops audio).** ffmpeg's
+   automatic audio passthrough is OFF whenever `-filter_complex` is used. The letterbox branch uses
+   `-filter_complex`; without an explicit audio map the turn renders SILENT. (This is exactly how reel-2's
+   t3 lost its audio while the simple `-vf` turns kept theirs.) Always map `[outv]` + `0:a?`.
+
+## NEVER re-encode/overwrite a source clip in place — transform in the composition
+
+Do all visual changes — crop, zoom, reframe, color grade — **in the render composition** (CSS
+transform / objectFit / filter, or the band-crop step that writes to the turns dir), never by
+re-encoding a source asset in `public/uploads/**` over itself. Sources are gitignored originals (no
+undo) and an ad-hoc re-encode commonly drops the audio track. If you genuinely need a transformed clip
+on disk, write it to a NEW path and point the props/manifest at it. To repair one turn, use the surgical
+`node scripts/reel2-build-act1.mjs --recut-top <t>` (re-cuts head-safe + audio, touches nothing else).
+
 ## Source of truth in code
 
 `scripts/multi-aroll-stage3-4.mjs` → `calculateSquareCrop()` is the single

@@ -151,6 +151,28 @@ offsets, per-range overlay positions, and animated x/y all live inside this one
 pass. Never render segments separately and concatenate — concat creates flashes
 at video boundaries and pops/gaps at audio boundaries.
 
+## 14. A frame/style score is BLIND to audio and to motion — gate them separately
+
+The Gemini style-fidelity score compares STILL FRAMES. It rose 65→76 in one run while a dialogue turn
+went completely SILENT, and it can't see a chin clipping only on the lean-in frame. A rising score is
+not "better" — it's "better-looking in the sampled stills."
+
+**Rule:** Never declare a render good on the visual score alone. Run an explicit **audio-continuity**
+gate (per-segment `volumedetect`: every talking segment must carry audio) and a **per-frame** head-safety
+gate (worst frame, not the median), and actually WATCH + LISTEN to the output. The score is a smoke
+test; audio + motion gates + human review are the truth. (reel-2, 2026-06-03.)
+
+## 15. Apply visual transforms in the COMPOSITION — never re-encode a source asset in place
+
+A subagent "tightened the crop" by re-encoding a source turn clip over itself; the re-encode used
+`-filter_complex` (which disables ffmpeg's auto audio passthrough) and dropped the turn's audio, and the
+source — gitignored — had no undo.
+
+**Rule:** Crop/zoom/reframe/grade live in the render layer (Remotion CSS transform/filter, or a crop
+step that writes a NEW file). Never overwrite an asset in `public/uploads/**` in place. If a clip-level
+transform is unavoidable, write to a new path + update props, and if it uses `-filter_complex`, map audio
+explicitly (`-map 0:a?`). See `docs/cropping-rules.md`.
+
 ---
 
 ## The pipeline shape this produces
