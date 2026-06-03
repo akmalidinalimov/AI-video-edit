@@ -2,6 +2,7 @@ import React from "react";
 import { Composition, type CalculateMetadataFunction } from "remotion";
 import { StyleCloneVideo, type StyleCloneVideoProps } from "./compositions/StyleCloneVideo";
 import { Reel2Video, type Reel2Props } from "./compositions/Reel2Video";
+import { MotionLibraryProbe, PROBE_DURATION } from "./compositions/MotionLibraryProbe";
 import { VDIM } from "./utils/vdim";
 import { DEFAULT_RENDER_CONFIG } from "@/lib/types/render";
 import type { CaptionStyle } from "@/lib/types/timeline";
@@ -41,8 +42,20 @@ export const RemotionRoot: React.FC = () => {
     fps: props.fps || VDIM.FPS,
   });
 
+  const MotionProbeComponent = MotionLibraryProbe as unknown as React.ComponentType<Record<string, unknown>>;
+
   return (
     <>
+      {/* Motion-library render-test probe — 16 self-contained pattern segments (Step B). */}
+      <Composition
+        id="MotionLibraryProbe"
+        component={MotionProbeComponent}
+        durationInFrames={PROBE_DURATION}
+        fps={VDIM.FPS}
+        width={VDIM.WIDTH}
+        height={VDIM.HEIGHT}
+      />
+
       {/* Reel 2: cloned IMG_6298 editing style */}
       <Composition
         id="Reel2Video"
