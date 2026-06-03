@@ -26,6 +26,23 @@ regression 18/18 → render → `reel2-audio-check` + `reel2-crop-check` + `reel
 - **+3 (find-skills):** searched registry. The official `remotion-dev/skills@remotion-best-practices`
   (347K installs) is ALREADY installed + vetted; no other skill clears the trust bar (rest are CSS/Flutter/
   three.js/SwiftUI, not our pipeline). DECISION: no new install — enrich via our own docs/remotion-authoring.md.
-- **A (authoring):** background agent drafting `docs/remotion-authoring.md`. Pending: motion-library param
-  enrichment + `MotionLibraryProbe` comp + `scripts/motion-library-check.mjs` (Step B) — deferred until the
-  current render finishes (don't edit Root.tsx mid-bundle).
+- **A (authoring):** `docs/remotion-authoring.md` written (266 lines, grounded in real repo code) — COMMITTED `d178492`.
+- **C verified:** closed-loop READY (crop/cut/audio green) + watched the Act-2 blue accent (clean, consistent).
+  Committed `d178492`. style-fidelity **76 → 79** (layout 82, motion 77, composition 73, pacing 73 up;
+  **colorGrade FLAT at 76** — the accent didn't move that dim per Gemini; score is noisy + partly the cumulative
+  t3 fixes). Honest: deeper colorGrade tuning (per-band grade / SVG split-tone) needs the iterate loop run WITH
+  the operator. Step C overnight goal met (>76, route+capability wired, looks good, gates green).
+- **B + motion-lib enrich:** two WORKTREE agents ran in PARALLEL (saved ~10 min vs serial), disjoint files, both merged clean:
+  - `motionlib-enrich` → `86e7222` MERGED (ff): concrete param ranges + Remotion snippets for all 16 patterns
+    across docs/motion-library/{camera,elements,text,transitions}.md (real values, cited line numbers).
+  - `probe-build` → merged (3-way, clean): `MotionLibraryProbe.tsx` (16 patterns × 36f, self-contained, no media)
+    + `scripts/motion-library-check.mjs` (renders probe, per-segment brightness gate) + regression check (now 19/19).
+    Agent self-verified: all 16 patterns render with visible content. Re-verifying in main tree (b0vz8ezoc).
+- Regression after both merges: **19/19 green**. Worktrees locked by harness (auto-clean).
+
+## Final state (overnight)
+- Commits on reel2-aroll-v3 this run: `d178492` (Step C color + closed-loop + authoring playbook) → `86e7222`
+  (motion-lib params) → probe merge. reel2 fidelity 76→79; all gates green; regression 19/19.
+- Remaining for the operator (with the iterate loop / decisions): deeper colorGrade tuning (per-band grade /
+  SVG split-tone — route now wired), Stage D real B-roll (needs PEXELS key), Stage E measured decode, Stage F
+  ~20-reel corpus (needs videos+licenses), CTA-tail audio/voice role. See docs/NEXT-SESSION-HANDOFF.md.
