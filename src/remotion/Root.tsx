@@ -52,7 +52,7 @@ export const RemotionRoot: React.FC = () => {
         width={VDIM.WIDTH}
         height={VDIM.HEIGHT}
         calculateMetadata={calcReel2 as CalculateMetadataFunction<Record<string, unknown>>}
-        defaultProps={{ fps: VDIM.FPS, width: VDIM.WIDTH, height: VDIM.HEIGHT, durationInFrames: 300, logoText: "AI", segments: [] }}
+        defaultProps={{ fps: VDIM.FPS, width: VDIM.WIDTH, height: VDIM.HEIGHT, durationInFrames: 300, logoText: "M", topPillText: "Real Video", bottomPillText: "Lip Sync Seedance 2.0", segments: [] }}
       />
 
       {/* Main 9:16 vertical video */}

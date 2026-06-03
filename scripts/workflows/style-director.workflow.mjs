@@ -127,7 +127,8 @@ let buildBrief =
   `Shot specs: ${JSON.stringify(shotSpecs).slice(0, 5000)}\n` +
   `Motion recipes: ${JSON.stringify(motionRecipes).slice(0, 4000)}\n` +
   `Edit plan: ${JSON.stringify(editPlan?.timeline || []).slice(0, 3000)}\n` +
-  `Use the remotion-best-practices skill + our gotchas (OffthreadVideo w/ 120s timeout, loop short clips, fade only segment 0, NO CSS transitions, frame-aligned ranges). Compositions live in src/remotion/compositions/.`;
+  `Use the remotion-best-practices skill + our gotchas (OffthreadVideo w/ 120s timeout, loop short clips, fade only segment 0, NO CSS transitions, frame-aligned ranges). Compositions live in src/remotion/compositions/.\n` +
+  `GUARDRAIL — never clobber source assets: do ALL visual changes (crop, zoom, grade, reframe) IN the composition via CSS transform/objectFit/filter. NEVER re-encode or overwrite a source clip in public/uploads/** in place (they are gitignored originals WITH AUDIO — re-encoding drops the audio track and there is no undo). If you genuinely need a transformed clip on disk, write it to a NEW path and update props to point at it.`;
 
 while (iter < MAX_ITERS) {
   iter++;
@@ -150,8 +151,12 @@ while (iter < MAX_ITERS) {
   const verify = await agent(
     `Run the verification gates via Bash and report results as JSON:\n` +
     `  node scripts/style-fidelity.mjs ${OUT_MP4} --ref ${REF_ID}${PAIRS ? ` --pairs "${PAIRS}"` : ''}\n` +
-    `  node scripts/reel2-cut-check.mjs ; node scripts/reel2-crop-check.mjs ; node scripts/test-regression.mjs\n` +
-    `Read the written style-fidelity-report.json. Return {overall, lowestDims, punchList:[{issue,dim,route,fix}], gates:{cut,crop,regression}}. ` +
+    `  node scripts/reel2-cut-check.mjs ; node scripts/reel2-crop-check.mjs ; node scripts/reel2-audio-check.mjs ; node scripts/test-regression.mjs\n` +
+    `Read the written style-fidelity-report.json. Return {overall, lowestDims, punchList:[{issue,dim,route,fix}], gates:{cut,crop,audio,regression}}. ` +
+    `HARD GATE: if reel2-audio-check.mjs exits non-zero, a talking segment went SILENT (usually a source ` +
+    `clip got clobbered/muted) — this is a BLOCKING regression. Do NOT report the iteration as improved; ` +
+    `add it to the punchList (route "editor", fix "restore the silenced segment's source-clip audio") and ` +
+    `set gates.audio=false. The frame-only style score can rise while audio is broken — the audio gate is authoritative for sound. ` +
     `Route each punch-list item to the responsible role: motion-designer | remotion-engineer | editor | broll-director | color.`,
     { label: `verify#${iter}`, phase: 'Verify', schema: FIDELITY }
   );

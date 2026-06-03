@@ -15,8 +15,25 @@ is also at `~/.claude/plans/continue-reel-2-v3-delegated-parasol.md`, but THIS c
   render-tested standalone.
 - 🟡 **broll-engine** (`scripts/broll-engine.mjs`) — cost-aware router proven via `--dry-run`; real stock
   fetch + generation never exercised. Routing: stock → Kling 3.0 @1080p default → Seedance 2.0 @720p gated.
-- ❌ **style-director orchestrator** (`scripts/workflows/style-director.workflow.mjs` + skill) — syntax-only;
-  NEVER run end-to-end; subagent prompts unproven.
+- ✅ **style-director orchestrator** (`scripts/workflows/style-director.workflow.mjs` + skill) — PROVEN
+  end-to-end (Stage-1 item-1, 2026-06-03). One run: 4 iters, decode→plan→build→render→verify loop raised
+  style-fidelity **65→76** on reel2 vs IMG_6298; cut-check + crop-check green. Target 85 NOT reached —
+  plateaus at 76 because the top punch-list items route to **`color`**, which has **no implementing role**
+  (the FIDELITY schema lists a `color` route but the iterate loop only feeds the Remotion-Engineer; there
+  is no LUT/grade step in the composition). Other residual gaps: tighter crops, faster pacing (Act-2
+  V1/A1 timeline + waveform + moving playhead ARE present in the final render — the Gemini scorer
+  sampled frames that missed them, so Act-2 layout/motion is scored harsh).
+  **AUDIO GAP (was critical — NOW FIXED):** the verify loop had NO audio gate, so it raised the visual
+  score while SILENCING turn t3. Root cause: `cutTop` (reel2-build-act1.mjs) letterbox branch used
+  `-filter_complex` with no `-map 0:a` → ffmpeg dropped audio; t3 is the only letterbox (close-subject)
+  turn. Fixes shipped: `cutTop` now maps `[outv]`+`0:a?`; new `scripts/reel2-audio-check.mjs` per-segment
+  gate wired into the verify loop as a HARD GATE; new `--recut-top <t>` surgical re-cut; no-clobber
+  guardrail in the build brief. t3 re-cut + re-rendered: audio/crop/cut all PASS. STILL OPEN: the CTA
+  end (27.2-33.5s) is silent in both renders (deferred music bed) → wants the voice/audio role.
+  Findings: (a) `args.maxIters:2` did NOT take — ran the default 4 (verify args plumbing before relying
+  on it for cost caps); (b) subagents littered shell-junk files on Windows (bad redirection) — clean up,
+  never `git add .`. Build edits left UNCOMMITTED in `src/remotion/{Root,compositions/Reel2Video,
+  compositions/Act2NodeEditor}.tsx` + `docs/motion-library/elements.md` (net +11, keep).
 
 ## Decisions (locked)
 1. Sequence = **solidify-then-elevate**. 2. Decode = **full measurement fusion** (wire existing libs + RAFT

@@ -58,6 +58,21 @@ const r = interpolate(frame, [appear, appear+dur], [100,0], ease);
 - **source:** clip-path pattern (Remotion-safe; no CSS transition).
 
 ---
+## dim-deemphasize (de-emphasis / "layer removed")
+- **When:** demote one element while a sibling stays bright — e.g. "remove the video layer, keep audio":
+  the V1 clip dims (darker/lower opacity) while the A1 waveform holds full brightness.
+- **Signature:** target's brightness/opacity ramps DOWN to a floor (not to 0) over a hold window; no movement,
+  no layout shift; sibling untouched. Pairs with a `cross-dissolve` of any thumbnail content fading to black.
+- **params:** `{ appear, dur, fromBright:1, toBright:0.45, fromOpacity:1, toOpacity:0.7 }`.
+- **Snippet:**
+```tsx
+const b = interpolate(frame, [appear, appear+dur], [fromBright, toBright], ease);
+const o = interpolate(frame, [appear, appear+dur], [fromOpacity, toOpacity], ease);
+// style on the demoted element only: filter:`brightness(${b})`, opacity:o  (sibling keeps brightness(1))
+```
+- **source:** `interpolate` brightness/opacity ramp (general); de-emphasis ramp, sibling-isolated.
+
+---
 ## number-counter (stat roll-up)
 - **When:** infographic stats, metrics counting up.
 - **Signature:** number interpolates to target, eased; often paired with scale-pop on the card.

@@ -224,33 +224,81 @@ function detectFace(videoPath, samples = 10) {
     execFileSync(PY_VISION, [YUNET, videoPath, out, "--samples", String(samples)], { stdio: "pipe" });
     const j = JSON.parse(fs.readFileSync(out, "utf-8"));
     try { fs.unlinkSync(out); } catch {}
+    // Motion envelope across the per-frame samples: the HIGHEST crown (smallest headTopY) and the
+    // LOWEST chin (largest faceTopY+height) over the turn — this is what a lean-in pushes, and what
+    // the band crop must contain head-safe. calculateBandCrop uses it to size the window minimally.
+    const S = Array.isArray(j.samples) ? j.samples : [];
+    const crowns = S.map(s => s.headTopY).filter(x => typeof x === "number");
+    const chins = S.map(s => (typeof s.faceTopY === "number" && typeof s.height === "number") ? s.faceTopY + s.height : null).filter(x => x != null);
     return { centerX: j.median.centerX, faceTopY: j.median.topY, height: j.median.height,
-             headTopY: j.headTopY, srcW: j.fullWidth, srcH: j.fullHeight };
+             headTopY: j.headTopY, srcW: j.fullWidth, srcH: j.fullHeight,
+             crownMinY: crowns.length ? Math.min(...crowns) : undefined,
+             chinMaxY: chins.length ? Math.max(...chins) : undefined };
   } catch { return null; }
 }
 
 /**
- * Head-safe band crop (docs/cropping-rules.md): full-width band of the 1080:840 aspect,
- * positioned so the extended head-top keeps TOP_GAP headroom and shoulders fall below.
- *   -> { cropW, cropH, cropX, cropY }
+ * Head-safe band crop (docs/cropping-rules.md), band aspect 1080:840.
+ *   -> { cropW, cropH, cropX, cropY, letterbox }
+ *
+ * ITERATION-4 REWRITE (fix #1 — t3 STILL clipped: headTop(min)=0).
+ * Root cause (measured): for a CLOSE subject (t3 face = ~80% of the band height) a full-width
+ * band-aspect window simply cannot fit headroom + chin at once — at every workable TOP_GAP the
+ * chin pushes past the band bottom OR the crown clips the top, AND the thin motion margin let the
+ * lean-in frame hit headTop=0. The only real fix is to ZOOM OUT so the face is a safe fraction of
+ * the band — but a 720-wide source can't give a band-aspect window taller than 560px without
+ * exceeding its width. So when the face is too big, we take a TALLER window (up to full source
+ * height), accept that it's NARROWER than the band aspect, and letterbox the sides with a blurred
+ * fill of the same frame (never a stretch — docs/cropping-rules.md "a band is a CROP, never a
+ * stretch"). This shrinks the face to FACE_FRAC_TARGET of the band so headroom AND chin both fit.
  */
 function calculateBandCrop(srcW, srcH, face) {
-  let cropW = srcW;                                  // full width = max vertical extent for the band aspect
+  const heightFrac = face.height ?? 0.24;
+  const faceTopY = face.faceTopY ?? 0.18;
+  const headTopY = face.headTopY ?? Math.max(0, faceTopY - heightFrac * 0.18);
+  // Match the rendered gate (reel2-crop-check): crown gap >= GAP_MIN, face bottom <= BOTTOM_MAX.
+  const GAP_MIN = 0.03, BOTTOM_MAX = 0.99, GAP_TARGET = 0.06;
+  // Motion envelope (lean-in): HIGHEST crown + LOWEST chin across the turn's detection samples, with
+  // a small pad for detection-vs-render noise. The band must contain THIS, not just the static face.
+  const PAD = 0.012;
+  const crownMinY = (face.crownMinY ?? headTopY) - PAD;
+  const chinMaxY = (face.chinMaxY ?? (faceTopY + heightFrac)) + PAD;
+  const crownPx = crownMinY * srcH, chinPx = chinMaxY * srcH;
+
+  // Full-width band-aspect window (max vertical extent, never wider than source) — the DEFAULT.
+  let cropW = srcW;
   let cropH = Math.round(cropW / BAND_ASPECT);
   if (cropH > srcH) { cropH = srcH; cropW = Math.round(cropH * BAND_ASPECT); }
 
-  // Position by the FACE-BOX CENTER at FACE_CENTER_Y_IN of the band (mirrors reel-1's
-  // calculateSquareCrop). This balances headroom vs chin automatically and stays stable when
-  // the speaker LEANS in (his face moves but its center stays near the same band fraction) —
-  // far more robust than anchoring to the extended head-top, whose estimate is detector-
-  // dependent and over-gave headroom while clipping the chin on the lean-in turns (t3).
-  const FACE_CENTER_Y_IN = 0.45;                      // face-box center sits at 45% of the band
-  const faceCenterPx = ((face.faceTopY ?? 0.18) + (face.height ?? 0.24) / 2) * srcH;
-  let cropY = Math.round(Math.max(0, Math.min(srcH - cropH, faceCenterPx - FACE_CENTER_Y_IN * cropH)));
+  // Smallest window that fits the whole crown..chin envelope head-safe (crown>=GAP_MIN, chin<=BOTTOM_MAX).
+  const usable = BOTTOM_MAX - GAP_MIN;                       // fraction of cropH available for crown..chin
+  const minCropH = Math.ceil((chinPx - crownPx) / usable);
+  let letterbox = false, cropY;
+
+  if (minCropH <= cropH) {
+    // FULL-BLEED full-width (preferred — identical treatment to every other turn, no pillarbox).
+    const cropYmax = crownPx - GAP_MIN * cropH;
+    const cropYmin = chinPx - BOTTOM_MAX * cropH;
+    const target = crownPx - GAP_TARGET * cropH;
+    cropY = Math.round(Math.max(cropYmin, Math.min(cropYmax, target)));
+  } else {
+    // MINIMAL zoom-out: grow the window JUST enough to contain the lean-in envelope, so the face
+    // stays as large as the full-bleed turns and the blurred side-fill is as thin as possible (NOT
+    // the old fixed 0.52 zoom-out, which shrank the face and added a huge pillarbox). Letterbox only
+    // because the taller window is narrower than the band aspect (docs/cropping-rules.md: crop, never stretch).
+    cropH = Math.min(srcH, minCropH);
+    const widthForAspect = Math.round(cropH * BAND_ASPECT);
+    if (widthForAspect > srcW) { cropW = srcW; letterbox = true; }
+    else cropW = widthForAspect;
+    // center the leftover slack so neither crown nor chin sits exactly on a gate edge
+    const slack = Math.max(0, usable * cropH - (chinPx - crownPx));
+    cropY = Math.round(crownPx - (GAP_MIN + slack / (2 * cropH)) * cropH);
+  }
+  cropY = Math.max(0, Math.min(srcH - cropH, cropY));
 
   let cropX = Math.round((face.centerX ?? 0.5) * srcW - cropW / 2);
   cropX = Math.max(0, Math.min(srcW - cropW, cropX));
-  return { cropW, cropH, cropX, cropY };
+  return { cropW, cropH, cropX, cropY, letterbox };
 }
 
 /**
@@ -263,8 +311,27 @@ function cutTop(clipPath, start, dur, out, fallbackFace) {
   let face = detectFace(raw, 10) || fallbackFace ||
     { centerX: 0.5, faceTopY: 0.18, height: 0.24, headTopY: 0.14, srcW: 720, srcH: 1280 };
   const c = calculateBandCrop(face.srcW || 720, face.srcH || 1280, face);
+  // When the head-safe window is NARROWER than the band aspect (close-subject zoom-out), do NOT
+  // stretch it to 1080×840 (that would distort faces — forbidden by docs/cropping-rules.md). Scale
+  // it to the band HEIGHT and place it; fill the side margins with a blurred, scaled copy of the
+  // same crop so the band stays full-bleed and clean (cinema-style side fill, not a hard pillarbox).
+  // OFF-CENTER (fix #5 — reference frames the subject slightly off-center, not dead-center): bias
+  // the sharp foreground ~7% of the side-margin off-center so it reads like the reference's framing
+  // rather than a centered medium shot. The blurred fill behind covers the asymmetric gap.
+  const OFFCENTER = 0.14;   // fraction of the side-margin to bias the foreground from center
+  const vf = c.letterbox
+    ? `[0:v]crop=${c.cropW}:${c.cropH}:${c.cropX}:${c.cropY},setsar=1,split=2[fg][bg];` +
+      `[bg]scale=${BAND_W}:${BAND_H},boxblur=24:2,eq=brightness=-0.06[bgb];` +
+      `[fg]scale=-2:${BAND_H}[fgs];` +
+      `[bgb][fgs]overlay=(W-w)/2-(W-w)/2*${OFFCENTER}:0,setsar=1[outv]`
+    : `crop=${c.cropW}:${c.cropH}:${c.cropX}:${c.cropY},scale=${BAND_W}:${BAND_H},setsar=1`;
+  // filter_complex disables ffmpeg's automatic audio passthrough — without an explicit -map the
+  // letterbox branch silently drops the turn's audio (this is exactly how t3 went silent: t3 is the
+  // only close-subject letterbox turn). Map the labelled video output AND the source audio.
+  // The simple -vf branch keeps audio automatically, so it needs no -map.
+  const vfArg = c.letterbox ? ["-filter_complex", vf, "-map", "[outv]", "-map", "0:a?"] : ["-vf", vf];
   execFileSync(FFMPEG, ["-y", "-i", raw,
-    "-vf", `crop=${c.cropW}:${c.cropH}:${c.cropX}:${c.cropY},scale=${BAND_W}:${BAND_H},setsar=1`,
+    ...vfArg,
     "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", "-loglevel", "error", out], { stdio: "pipe" });
   try { fs.unlinkSync(raw); } catch {}
@@ -336,6 +403,23 @@ function doTrim() {
   buildProps(manifest);
 }
 
+// Re-cut a SINGLE top turn head-safe (+ audio) from its source clip, using the saved manifest
+// timing. Surgical: rewrites only top-t<N>.mp4 + audio-t<N>.wav; touches nothing else (no re-trim,
+// no props rebuild, no Act-2 changes). Use to repair one clobbered/silenced turn.
+function doRecutTop(t) {
+  const man = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf-8"));
+  const rec = (man.turns || []).find(x => x.t === t);
+  if (!rec) throw new Error(`--recut-top ${t}: no turn t${t} in ${MANIFEST_PATH}`);
+  const clipPath = CLIPS[rec.clip].path;
+  const fallback = detectFace(clipPath, 15);
+  const topOut = path.join(TURNS_DIR, `top-t${t}.mp4`);
+  const audioOut = path.join(TURNS_DIR, `audio-t${t}.wav`);
+  const { crop } = cutTop(clipPath, rec.start, rec.dur, topOut, fallback);
+  cutAudio(clipPath, rec.start, rec.dur, audioOut);
+  console.log(`  re-cut t${t} from clip${rec.clip} ${rec.start.toFixed(3)}s +${rec.dur.toFixed(3)}s ` +
+    `| crop ${crop.cropW}x${crop.cropH}+${crop.cropX}+${crop.cropY}${crop.letterbox ? " (letterbox)" : ""} -> ${topOut}`);
+}
+
 // ════════════════════════════════════════════════════════ PROPS
 // Act-2 ("how it's made"), defined explicitly so a full rebuild reproduces it (no dependency on
 // the previous gitignored props): an EXPLAINER segment (animated StepFlow + talking Bob, audio ON,
@@ -351,11 +435,12 @@ function buildProps(manifest) {
   const segments = [];
   let f = 0;
   for (const turn of manifest) {
+    // Pills/divider/M-logo are FIXED chrome rendered once by the composition (driven by the
+    // top-level topPillText/bottomPillText props), NOT per-segment — so no per-cut label info here.
     segments.push({
       startFrame: f, endFrame: f + turn.frames, kind: "split",
-      topSrc: turn.topSrc, topLabel: "Real Video",
+      topSrc: turn.topSrc,
       bottomSrc: turn.bottomSrc, bottomFromSec: 0,
-      bottomLabel: turn.char === "bob" ? "Bob — AI (Wan 2.7)" : "Zig — AI (Wan 2.7)",
     });
     f += turn.frames;
   }
@@ -366,7 +451,10 @@ function buildProps(manifest) {
   }
 
   const props = {
-    fps: FPS, width: 1080, height: 1920, durationInFrames: f, logoText: prev?.logoText || "AI",
+    fps: FPS, width: 1080, height: 1920, durationInFrames: f,
+    logoText: prev?.logoText || "M",
+    topPillText: prev?.topPillText || "Real Video",
+    bottomPillText: prev?.bottomPillText || "Lip Sync Seedance 2.0",
     ...(prev?.musicSrc ? { musicSrc: prev.musicSrc } : {}),
     segments,
   };
@@ -471,6 +559,16 @@ async function main() {
   if (only.includes("--props")) {
     console.log("=== PROPS (rebuild from manifest, no re-cut) ===");
     buildProps(JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf-8")).turns);
+    console.log("\nDONE.");
+    return;
+  }
+  // --recut-top <t>: surgical single-turn head-safe (+audio) re-cut, no full re-trim / props rebuild.
+  const recutIdx = args.indexOf("--recut-top");
+  if (recutIdx >= 0) {
+    const t = Number(args[recutIdx + 1]);
+    if (!Number.isInteger(t)) throw new Error("--recut-top requires a turn number, e.g. --recut-top 3");
+    console.log(`=== RECUT TOP t${t} (head-safe + audio, surgical) ===`);
+    doRecutTop(t);
     console.log("\nDONE.");
     return;
   }

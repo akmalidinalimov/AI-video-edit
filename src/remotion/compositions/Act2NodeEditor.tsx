@@ -5,284 +5,263 @@ import {
 } from "remotion";
 
 /**
- * Act2NodeEditor (v3.6) — ELEVATED "how it's made": a premium, REAL-feeling Magnific "Spaces"
- * node editor, built 100% in Remotion (no AI-video UI — gen models render UI text as gibberish).
- *   - cinematic CAMERA: left→right pan across a wide world canvas + 2-layer parallax, then a
- *     zoom-OUT that reveals a dense node network (like the reference).
- *   - ORBIT INTRO: character thumbnails drift/orbit in behind the title.
- *   - GLASS nodes (Magnific structure): label ABOVE the card, content-filled body, dim prompt
- *     caption, left input dots + a right-edge output icon-stack; thin curved wires with a flowing
- *     gradient. Spotlight palette + minimap. Bob presenter PiP narrates (audio on).
- * Beat timing is synced to Bob's narration (bob-explainer.mp4). All node CONTENTS are our real
- * assets (Bob image + Wan 2.7 clip + real A-roll); only the UI/motion is Remotion.
+ * Act2NodeEditor (v6 — "TIMELINE EDITOR" rebuild) — the Magnific "how it's made" UI scene.
+ *
+ * ITERATION-4 FIDELITY REBUILD (fix #6 — Act-2 UI layout diverged hard from the reference):
+ * the reference's late UI shot is a TIMELINE EDITOR, not a node-graph and not a search/dropdown UI.
+ * It shows TWO STACKED PLAYERS (one large preview on top, one smaller below) over a timeline with
+ * V1 (video) + A1 (audio waveform) tracks and a vertical PLAYHEAD that scrubs across them.
+ *   - REMOVED (fix #6): the search bar, the frosted-glass dropdown menu, the right-edge VERTICAL
+ *     player-control strip, the bottom-left "2" step node + curved margin wire, and the bottom-left
+ *     minimap — none of these exist in the reference.
+ *   - ADDED (fix #6): a large player preview (the generated talking-character clip) + a smaller
+ *     stacked player below it; a TIMELINE PANEL with a V1 video track (clip thumbnails) and an A1
+ *     audio track (waveform), a ruler, and a moving PLAYHEAD that scrubs L→R (active editing feel).
+ *   - KEPT: Magnific wordmark header (top-center), Bob narrator PiP (bottom-left, audio on ~10s),
+ *     CTA hold, gentle push-in + drift camera + element entrances.
+ *   - MOTION (docs/motion-library): scale-pop (players, timeline panel entrance), slide-in (tracks),
+ *     a scrubbing playhead (interpolate sweep), push-in/drift camera, mask-reveal (clip thumbs).
  */
 
 const FONT = "Inter, Arial, sans-serif";
 const MONO = "ui-monospace, Menlo, monospace";
+
+// ── Reference teal / light-blue accent palette (cool studio UI). ──
+const TEAL = "#5ec8d8";          // primary accent (teal / light-blue)
+const TEAL_SOFT = "#8fdce8";     // lighter teal
+const TEAL_DIM = "rgba(94,200,216,0.55)";
+const TEAL_LINE = "rgba(120,210,224,0.65)";   // thin outline
+const TRACK_BG = "rgba(16,22,28,0.9)";
+
 const A = {
   presenter: "uploads/gen/reel2/bob-explainer.mp4",
   charImg: "uploads/gen/reel2/bob-bear.png",
-  zigImg: "uploads/gen/reel2/zig-bunny.png",
-  videoClip: "uploads/gen/reel2/turns/bottom-t1.mp4",
-  zigClip: "uploads/gen/reel2/turns/bottom-t2.mp4",
-  realTop: "uploads/gen/reel2/turns/top-t1.mp4",
-  realGraph: "uploads/gen/reel2/ui/real_graph_band.png", // authentic Magnific dense node-graph (cropped from the reference)
+  videoClip: "uploads/gen/reel2/turns/bottom-t1.mp4",  // talking AI character (Wan 2.7) — large player
+  realTop: "uploads/gen/reel2/turns/top-t1.mp4",        // real A-roll man (smaller player)
   music: "sfx/act2-bed.mp3",
 };
 const rsrc = (s: string) => (s.startsWith("http") || s.startsWith("/") || s.includes("://")) ? s : staticFile(s);
-const Vid: React.FC<React.ComponentProps<typeof OffthreadVideo>> = (p) => (
-  <OffthreadVideo delayRenderTimeoutInMilliseconds={120000} {...p} />
+// `loop` is honored by OffthreadVideo at runtime (4.x) but absent from its public prop type, so we
+// accept it on the wrapper and forward via a typed cast — keeps short preview clips looping without
+// a tsc error (and without pulling in <Loop>, which would need an explicit durationInFrames here).
+type VidProps = React.ComponentProps<typeof OffthreadVideo> & { loop?: boolean };
+const Vid: React.FC<VidProps> = (p) => (
+  <OffthreadVideo delayRenderTimeoutInMilliseconds={120000} {...(p as React.ComponentProps<typeof OffthreadVideo>)} />
 );
 const ease = { easing: Easing.bezier(0.16, 1, 0.3, 1), extrapolateLeft: "clamp" as const, extrapolateRight: "clamp" as const };
 
-// ── small SVG node icons ──
-const Icon: React.FC<{ k: string; s?: number; c?: string }> = ({ k, s = 22, c = "#cfe3ff" }) => {
+// ── small inline SVG icons (render-safe; no emoji → no tofu) ──
+const Icon: React.FC<{ k: string; s?: number; c?: string }> = ({ k, s = 22, c = TEAL }) => {
   const p = { width: s, height: s, viewBox: "0 0 24 24", fill: "none", stroke: c, strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   if (k === "image") return (<svg {...p}><rect x={3} y={4} width={18} height={16} rx={3} /><circle cx={8.5} cy={10} r={1.8} /><path d="M5 18 L10 12 L14 16 L17 13 L20 17" /></svg>);
   if (k === "video") return (<svg {...p}><rect x={3} y={5} width={18} height={14} rx={3} /><path d="M10 9 L15 12 L10 15 Z" fill={c} stroke="none" /></svg>);
   if (k === "audio") return (<svg {...p}><path d="M4 10 v4 M8 7 v10 M12 9 v6 M16 6 v12 M20 10 v4" /></svg>);
-  if (k === "text") return (<svg {...p}><path d="M5 6 H19 M12 6 V18 M9 18 H15" /></svg>);
+  if (k === "play") return (<svg {...p}><path d="M7 5 L19 12 L7 19 Z" fill={c} stroke="none" /></svg>);
+  if (k === "pause") return (<svg {...p}><rect x={7} y={5} width={3.5} height={14} rx={1} fill={c} stroke="none" /><rect x={13.5} y={5} width={3.5} height={14} rx={1} fill={c} stroke="none" /></svg>);
   return null;
 };
 
-// ── glass node card; label sits ABOVE the card (Magnific style) ──
-type NodeProps = { x: number; y: number; w: number; appear: number; label: string; accent: string; caption?: string; ports?: string[]; children?: React.ReactNode };
-const NodeCard: React.FC<NodeProps> = ({ x, y, w, appear, label, accent, caption, ports = ["image"], children }) => {
-  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
-  const s = spring({ frame: frame - appear, fps, config: { damping: 20, stiffness: 110 } });
-  if (frame < appear - 2) return null;
-  return (
-    <div style={{ position: "absolute", left: x, top: y, width: w, opacity: s, transform: `translateY(${(1 - s) * 24}px) scale(${0.92 + 0.08 * s})`, transformOrigin: "center top" }}>
-      <div style={{ color: "#8b9bb4", fontFamily: FONT, fontWeight: 600, fontSize: 21, marginBottom: 9, marginLeft: 4, letterSpacing: 0.2 }}>{label}</div>
-      <div style={{
-        position: "relative", borderRadius: 16,
-        background: "#16181d",
-        border: "1px solid rgba(255,255,255,0.06)",
-        boxShadow: `0 18px 44px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.04)`,
-        padding: 10,
-      }}>
-        {children}
-        {caption ? <div style={{ color: "#9fb0c9", fontFamily: MONO, fontSize: 17, marginTop: 9, padding: "0 4px 2px", lineHeight: 1.3 }}>{caption}</div> : null}
-        {/* left input dot */}
-        <div style={{ position: "absolute", left: -7, top: "50%", width: 13, height: 13, borderRadius: "50%", background: "#0b0d12", border: `2px solid ${accent}` }} />
-        {/* right output icon-stack */}
-        <div style={{ position: "absolute", right: -20, top: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-          {ports.map((pk, i) => (
-            <div key={i} style={{ width: 38, height: 38, borderRadius: 11, background: "rgba(20,25,36,0.96)", border: "1px solid rgba(255,255,255,0.12)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 4px 14px rgba(0,0,0,0.5)" }}>
-              <Icon k={pk} s={19} c="#aab9d4" />
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-};
-
-const mediaBox: React.CSSProperties = { width: "100%", borderRadius: 12, overflow: "hidden", background: "#000", display: "block" };
-
-// ── flowing curved connector (draw-on + drifting gradient dashes) ──
-const Wire: React.FC<{ x1: number; y1: number; x2: number; y2: number; appear: number; color: string }> = ({ x1, y1, x2, y2, appear, color }) => {
-  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
-  if (frame < appear) return null;
-  const draw = spring({ frame: frame - appear, fps, config: { damping: 200 } });
-  const mx = (x1 + x2) / 2;
-  const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-  const total = Math.hypot(x2 - x1, y2 - y1) + Math.abs(mx - x1) * 2 + 160;
-  const flow = -((frame - appear) * 3) % 28;
-  return (
-    <>
-      <path d={d} stroke={color} strokeOpacity={0.28} strokeWidth={5} fill="none" strokeDasharray={total} strokeDashoffset={total * (1 - draw)} />
-      <path d={d} stroke={color} strokeWidth={2.5} fill="none" strokeDasharray="3 25" strokeDashoffset={flow} strokeOpacity={draw} style={{ filter: `drop-shadow(0 0 6px ${color})` }} />
-    </>
-  );
-};
-
-// ── decorative "ghost" mini-nodes that populate the dense graph on zoom-out ──
-const GHOSTS = [
-  { x: 60, y: 70, k: "image" }, { x: 470, y: 40, k: "text" }, { x: 980, y: 60, k: "video" },
-  { x: 1620, y: 120, k: "image" }, { x: 1780, y: 520, k: "audio" }, { x: 40, y: 1140, k: "video" },
-  { x: 560, y: 1180, k: "image" }, { x: 1080, y: 1200, k: "text" }, { x: 1640, y: 1120, k: "video" },
-  { x: 1980, y: 820, k: "image" }, { x: 250, y: 600, k: "audio" }, { x: 1180, y: 880, k: "image" },
-];
-const Ghost: React.FC<{ x: number; y: number; k: string; reveal: number }> = ({ x, y, k, reveal }) => (
-  <div style={{ position: "absolute", left: x, top: y, width: 150, height: 96, borderRadius: 12, opacity: reveal * 0.5, background: "linear-gradient(160deg, rgba(30,37,51,0.8), rgba(16,20,30,0.85))", border: "1px solid rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-    <Icon k={k} s={26} c="#5b6b86" />
-  </div>
+// ── Magnific "M" glyph (small geometric mark for the wordmark) ──
+const MGlyph: React.FC<{ s?: number }> = ({ s = 40 }) => (
+  <svg width={s} height={s} viewBox="0 0 48 48" fill="none" style={{ display: "block" }}>
+    <path d="M7 39 V12 L24 30 L41 12 V39" stroke="#fff" strokeWidth={5.2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
+  </svg>
 );
 
-// ── Spotlight / command palette ──
-const PALETTE = [
-  { label: "Text", c: "#a78bfa" }, { label: "Image Generator", c: "#60a5fa" }, { label: "Video Generator", c: "#34d399" },
-  { label: "Assistant", c: "#f472b6" }, { label: "Image Upscaler", c: "#38bdf8" }, { label: "List", c: "#9fb0c9" },
-];
-const Spotlight: React.FC<{ x: number; y: number; appear: number; dismiss: number; highlight: number }> = ({ x, y, appear, dismiss, highlight }) => {
-  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
-  if (frame < appear || frame > dismiss) return null;
-  const s = spring({ frame: frame - appear, fps, config: { damping: 200 } });
-  const out = interpolate(frame, [dismiss - 7, dismiss], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
+const mediaFill: React.CSSProperties = { width: "100%", height: "100%", objectFit: "cover", display: "block" };
+
+// content column geometry (single centered column; players + timeline stack vertically)
+const COL_X = 90, COL_W = 900;
+
+// ── Audio WAVEFORM bar field (render-safe — deterministic pseudo-random heights). ──
+// A1 track content. Bars are static-shaped (a fixed sampled envelope) so the render is
+// deterministic; the playhead sweeping across them reads as scrubbing audio.
+const WaveBars: React.FC<{ w: number; h: number; played: number }> = ({ w, h, played }) => {
+  const N = Math.max(24, Math.floor(w / 9));
+  const bars = React.useMemo(() => Array.from({ length: N }, (_, i) => {
+    // deterministic envelope: layered sines → speech-like amplitude
+    const e = 0.30 + 0.34 * Math.abs(Math.sin(i * 0.45)) + 0.22 * Math.abs(Math.sin(i * 0.13 + 1.1)) + 0.12 * Math.abs(Math.sin(i * 1.7));
+    return Math.min(1, e);
+  }), [N]);
   return (
-    <div style={{ position: "absolute", left: x, top: y, width: 360, borderRadius: 16, overflow: "hidden", opacity: s * out, transform: `translateY(${(1 - s) * 12}px)`, background: "rgba(16,20,30,0.96)", border: "1px solid rgba(255,255,255,0.12)", boxShadow: "0 24px 70px rgba(0,0,0,0.75)", zIndex: 45 }}>
-      <div style={{ padding: "13px 16px", borderBottom: "1px solid rgba(255,255,255,0.08)", color: "#7d8aa0", fontFamily: FONT, fontSize: 21 }}>Search nodes…</div>
-      {PALETTE.map((p, i) => (
-        <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", background: i === highlight ? "rgba(96,165,250,0.18)" : "transparent" }}>
-          <div style={{ width: 20, height: 20, borderRadius: 6, background: p.c }} />
-          <div style={{ color: "#e6edf3", fontFamily: FONT, fontWeight: 600, fontSize: 22 }}>{p.label}</div>
-        </div>
-      ))}
+    <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", gap: 3, padding: "0 12px" }}>
+      {bars.map((amp, i) => {
+        const playedBar = i / N <= played;
+        return (
+          <div key={i} style={{
+            flex: 1, height: `${amp * (h - 18)}px`, borderRadius: 2,
+            background: playedBar ? `linear-gradient(${TEAL_SOFT},${TEAL})` : "rgba(120,160,180,0.40)",
+          }} />
+        );
+      })}
     </div>
   );
 };
 
-const Cursor: React.FC<{ keys: { at: number; x: number; y: number }[] }> = ({ keys }) => {
-  const frame = useCurrentFrame();
-  const x = interpolate(frame, keys.map(k => k.at), keys.map(k => k.x), ease);
-  const y = interpolate(frame, keys.map(k => k.at), keys.map(k => k.y), ease);
-  return (
-    <svg width="30" height="34" viewBox="0 0 24 28" style={{ position: "absolute", left: x, top: y, zIndex: 60, filter: "drop-shadow(0 2px 5px rgba(0,0,0,0.7))" }}>
-      <path d="M3 2 L3 22 L9 16 L13 25 L16 23 L12 15 L20 15 Z" fill="#fff" stroke="#0b0d12" strokeWidth={1.5} strokeLinejoin="round" />
-    </svg>
-  );
-};
+// ── TIMELINE PANEL (fix #6): ruler + V1 video track (clip thumbs) + A1 audio waveform + playhead. ──
+const TimelinePanel: React.FC<{ x: number; y: number; w: number; appear: number }> = ({ x, y, w, appear }) => {
+  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
+  if (frame < appear - 2) return null;
+  const s = spring({ frame: frame - appear, fps, config: { damping: 22, stiffness: 120 } });
+  const trackIn = (i: number) => interpolate(frame - appear, [8 + i * 6, 22 + i * 6], [0, 1], ease);
 
-// ── orbit intro: character thumbnails drift in a loose ring ──
-const ORBIT = [
-  { src: A.charImg, kind: "img", a: 0 }, { src: A.zigImg, kind: "img", a: 1 },
-  { src: A.realTop, kind: "vid", a: 2 }, { src: A.videoClip, kind: "vid", a: 3 },
-];
-const OrbitIntro: React.FC<{ end: number }> = ({ end }) => {
-  const frame = useCurrentFrame();
-  const gone = interpolate(frame, [end - 16, end], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
-  if (frame > end) return null;
-  const cx = 540, cy = 760, R = 300;
+  const PANEL_H = 360;
+  const RULER_H = 40, LABEL_W = 70, TRACK_H = 116, TRACK_GAP = 16;
+  const tracksX = LABEL_W + 12;
+  const tracksW = w - tracksX - 18;
+
+  // PLAYHEAD scrubs L→R across the tracks (active editing feel); loops the visible window.
+  const sweep = ((frame - appear) % 210) / 210;     // 0..1 sweep position
+  const playheadX = tracksX + sweep * tracksW;
+
+  // V1 video track: 3 clip blocks of varying width (a cut sequence)
+  const clips = [{ w: 0.30, label: "char.mp4", k: "video" }, { w: 0.26, label: "real.mov", k: "video" }, { w: 0.40, label: "char.mp4", k: "video" }];
+
+  const trackTop = (i: number) => RULER_H + 10 + i * (TRACK_H + TRACK_GAP);
+
   return (
-    <AbsoluteFill style={{ opacity: gone, zIndex: 8 }}>
-      {ORBIT.map((o, i) => {
-        const ang = (i / ORBIT.length) * Math.PI * 2 + frame * 0.012;
-        const inn = interpolate(frame, [o.a * 5, o.a * 5 + 22], [0, 1], ease);
-        const x = cx + Math.cos(ang) * R - 130, y = cy + Math.sin(ang) * R * 0.78 - 90;
-        return (
-          <div key={i} style={{ position: "absolute", left: x, top: y, width: 260, height: 180, borderRadius: 18, overflow: "hidden", opacity: inn * 0.92, transform: `scale(${0.6 + 0.4 * inn})`, border: "1px solid rgba(255,255,255,0.12)", boxShadow: "0 18px 50px rgba(0,0,0,0.6)" }}>
-            {o.kind === "img" ? <img src={rsrc(o.src)} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <Vid src={rsrc(o.src)} muted loop style={{ width: "100%", height: "100%", objectFit: "cover" }} />}
+    <div style={{
+      position: "absolute", left: x, top: y, width: w, height: PANEL_H, borderRadius: 20,
+      opacity: s, transform: `translateY(${(1 - s) * 26}px) scale(${0.97 + 0.03 * s})`, transformOrigin: "center top",
+      background: "rgba(14,19,25,0.96)", border: `1.5px solid ${TEAL_LINE}`,
+      boxShadow: `0 22px 60px rgba(0,0,0,0.55), 0 0 30px ${TEAL_DIM}`, overflow: "hidden", zIndex: 14,
+    }}>
+      {/* ruler with tick marks + timecodes */}
+      <div style={{ position: "absolute", left: tracksX, right: 18, top: 0, height: RULER_H, borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+        {Array.from({ length: 9 }, (_, i) => (
+          <div key={i} style={{ position: "absolute", left: `${(i / 8) * 100}%`, top: 0, bottom: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+            <div style={{ width: 1, height: i % 2 === 0 ? 14 : 8, background: "rgba(160,190,205,0.45)" }} />
           </div>
-        );
-      })}
-    </AbsoluteFill>
+        ))}
+        {[0, 2, 4, 6, 8].map((i) => (
+          <div key={`t${i}`} style={{ position: "absolute", left: `${(i / 8) * 100}%`, top: 4, color: "#7d93a3", fontFamily: MONO, fontSize: 14 }}>0:0{i}</div>
+        ))}
+      </div>
+
+      {/* V1 — video track (clip thumbnails) */}
+      <div style={{ position: "absolute", left: 14, top: trackTop(0) + 38, color: TEAL_SOFT, fontFamily: FONT, fontWeight: 800, fontSize: 22, opacity: trackIn(0) }}>V1</div>
+      <div style={{ position: "absolute", left: tracksX, top: trackTop(0), width: tracksW, height: TRACK_H, borderRadius: 10, background: TRACK_BG, opacity: trackIn(0) }}>
+        {(() => { let acc = 0; return clips.map((c, i) => {
+          const left = acc * tracksW; acc += c.w; const cw = c.w * tracksW - 6;
+          return (
+            <div key={i} style={{ position: "absolute", left: left + 3, top: 6, width: cw, height: TRACK_H - 12, borderRadius: 8, overflow: "hidden", border: `1px solid ${TEAL_LINE}`, background: "#0c1116" }}>
+              {i === 1 ? <img src={rsrc(A.charImg)} style={{ ...mediaFill, filter: "brightness(0.85)" }} />
+                       : <Vid src={rsrc(A.videoClip)} muted loop style={{ ...mediaFill, filter: "brightness(0.85)" }} />}
+              <div style={{ position: "absolute", left: 8, top: 6, display: "flex", alignItems: "center", gap: 6, color: "#dff2f6", fontFamily: MONO, fontSize: 14, textShadow: "0 1px 3px rgba(0,0,0,0.9)" }}>
+                <Icon k="video" s={14} c={TEAL_SOFT} />{c.label}
+              </div>
+            </div>
+          );
+        }); })()}
+      </div>
+
+      {/* A1 — audio track (waveform) */}
+      <div style={{ position: "absolute", left: 14, top: trackTop(1) + 38, color: TEAL_SOFT, fontFamily: FONT, fontWeight: 800, fontSize: 22, opacity: trackIn(1) }}>A1</div>
+      <div style={{ position: "absolute", left: tracksX, top: trackTop(1), width: tracksW, height: TRACK_H, borderRadius: 10, background: TRACK_BG, opacity: trackIn(1), overflow: "hidden" }}>
+        <WaveBars w={tracksW} h={TRACK_H} played={sweep} />
+      </div>
+
+      {/* PLAYHEAD — vertical scrubbing line across both tracks */}
+      <div style={{ position: "absolute", left: playheadX, top: 0, bottom: 0, width: 2, background: TEAL_SOFT, boxShadow: `0 0 10px ${TEAL}`, opacity: s, zIndex: 20 }}>
+        <div style={{ position: "absolute", left: -6, top: 0, width: 14, height: 12, background: TEAL_SOFT, clipPath: "polygon(0 0, 100% 0, 50% 100%)" }} />
+      </div>
+    </div>
   );
 };
 
 export const Act2NodeEditor: React.FC<{ cta?: string }> = ({ cta = 'Comment "AI"' }) => {
-  const frame = useCurrentFrame(); const { fps, durationInFrames } = useVideoConfig();
+  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
 
-  // ── camera keyframes: pan L→R across the world, then zoom OUT ──
-  const camX = interpolate(frame, [70, 150, 230, 300, 360, 440], [60, 60, -360, -880, -880, -260], ease);
-  const camS = interpolate(frame, [70, 360, 440], [1, 1, 0.52], ease);
-  const camY = interpolate(frame, [70, 360, 440], [0, 0, 120], ease);
-  const ghostReveal = interpolate(frame, [380, 440], [0, 1], ease);
+  // gentle push-in + slow DRIFT camera (subtle continuous motion, not a static hold).
+  const camS = interpolate(frame, [0, 120, 300, 470], [1.05, 1.0, 1.012, 1.022], ease);
+  const camX = interpolate(frame, [0, 240, 470], [-8, 6, -4], ease);   // slow horizontal drift
+  const camY = interpolate(frame, [0, 120], [12, 0], ease);
 
-  // presenter PiP — Bob narrates ~10s (300f), fade out for CTA hold
+  // header (Magnific wordmark + title) springs in top-center
+  const headS = spring({ frame: frame - 4, fps, config: { damping: 200 } });
+
+  // presenter PiP — Bob narrates ~10s (300f), fade out for the CTA hold.
   const pipIn = interpolate(frame, [6, 18], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
   const pipOut = interpolate(frame, [288, 302], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
   const pip = pipIn * pipOut;
 
-  const titleS = spring({ frame: frame - 4, fps, config: { damping: 200 } });
-  const titleFade = interpolate(frame, [70, 95], [1, 0.55], ease); // title recedes as editor takes over
+  // BEATS: large player → smaller player → timeline panel with scrubbing playhead.
+  const BIG_AT = 18;
+  const SMALL_AT = 40;
+  const TIMELINE_AT = 70;
+
   const ctaAppear = 452;
   const ctaS = spring({ frame: frame - ctaAppear, fps, config: { damping: 13 } });
 
+  // player geometry (two stacked players above the timeline)
+  const BIG_Y = 250, BIG_H = 540;
+  const SMALL_Y = BIG_Y + BIG_H + 22, SMALL_W = 430, SMALL_H = 250;
+  const TIMELINE_Y = SMALL_Y + SMALL_H + 24;
+
+  const bigS = spring({ frame: frame - BIG_AT, fps, config: { damping: 20, stiffness: 120 } });
+  const smallS = spring({ frame: frame - SMALL_AT, fps, config: { damping: 20, stiffness: 120 } });
+  const bigPlaying = Math.floor(frame / 45) % 2 === 0;   // play/pause toggles → active feel
+
   return (
-    <AbsoluteFill style={{ background: "radial-gradient(120% 90% at 50% 18%, #11151f 0%, #0b0d12 60%, #07090d 100%)" }}>
-      {/* parallax dot-grid (drifts slower than the world) */}
-      <AbsoluteFill style={{
-        backgroundImage: "radial-gradient(circle, #1b2433 1.5px, transparent 1.5px)", backgroundSize: "46px 46px",
-        transform: `translateX(${camX * 0.45}px) scale(${camS})`, opacity: 0.6,
-      }} />
-
-      {/* WORLD layer (camera-transformed) */}
-      <AbsoluteFill style={{ transform: `translate(${camX}px, ${camY}px) scale(${camS})`, transformOrigin: "0 0" }}>
-        {/* dense-graph ghost nodes (revealed on zoom-out) */}
-        {/* REAL Magnific dense node-graph (authentic pixels) revealed on zoom-out, behind our nodes */}
-        <img src={rsrc(A.realGraph)} style={{ position: "absolute", left: -260, top: 60, width: 2700, opacity: ghostReveal * 0.9 }} />
-        {GHOSTS.map((g, i) => <Ghost key={i} {...g} reveal={ghostReveal * 0.5} />)}
-
-        {/* wires (world coords) */}
-        <svg width="2200" height="1400" style={{ position: "absolute", top: 0, left: 0, overflow: "visible" }}>
-          <Wire x1={585} y1={470} x2={760} y2={520} appear={172} color="#60a5fa" />{/* image -> video */}
-          <Wire x1={585} y1={905} x2={760} y2={600} appear={196} color="#3b82f6" />{/* audio -> video */}
-          <Wire x1={1190} y1={560} x2={1360} y2={620} appear={250} color="#34d399" />{/* video -> output */}
-        </svg>
-
-        {/* IMAGE GENERATOR node */}
-        <div style={{ position: "absolute", left: 120, top: 300 }}>
-          <NodeCard x={0} y={0} w={440} appear={96} label="Image Generator" accent="#60a5fa" caption="friendly cartoon bear, cozy living room" ports={["image"]}>
-            <div style={{ ...mediaBox, height: 300 }}><img src={rsrc(A.charImg)} style={{ width: "100%", height: "100%", objectFit: "cover" }} /></div>
-          </NodeCard>
+    <AbsoluteFill style={{ background: "radial-gradient(120% 90% at 50% 16%, #0f161d 0%, #0a0f14 60%, #06090c 100%)" }}>
+      {/* CONTAINED WORLD (gentle push-in + drift; everything inside moves together) */}
+      <AbsoluteFill style={{ transform: `translate(${camX}px, ${camY}px) scale(${camS})`, transformOrigin: "50% 42%" }}>
+        {/* ── header: Magnific WORDMARK top-CENTER + title ── */}
+        <div style={{ position: "absolute", top: 56, left: 0, right: 0, textAlign: "center", opacity: headS, transform: `translateY(${(1 - headS) * -16}px)`, zIndex: 30 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}>
+            <MGlyph s={42} />
+            <div style={{ color: "#fff", fontFamily: FONT, fontWeight: 800, fontSize: 46, letterSpacing: 0.5 }}>Magnific</div>
+          </div>
+          <div style={{ color: "#fff", fontFamily: FONT, fontWeight: 900, fontSize: 58, marginTop: 12, textShadow: `0 0 30px ${TEAL_DIM}` }}>Consistent Voice</div>
+          <div style={{ color: "#9fb0c9", fontFamily: FONT, fontWeight: 600, fontSize: 28, marginTop: 6 }}>Seedance 2.0</div>
         </div>
 
-        {/* AUDIO node */}
-        <div style={{ position: "absolute", left: 120, top: 760 }}>
-          <NodeCard x={0} y={0} w={440} appear={150} label="Your real voice" accent="#3b82f6" ports={["audio"]}>
-            <div style={{ display: "flex", alignItems: "center", gap: 4, height: 92, padding: "0 4px" }}>
-              {Array.from({ length: 40 }).map((_, i) => {
-                const h = 12 + Math.abs(Math.sin(i * 0.6 + frame * 0.25)) * 66;
-                return <div key={i} style={{ flex: 1, height: h, background: "#3b82f6", borderRadius: 3, opacity: 0.85 }} />;
-              })}
+        {/* ── LARGE PLAYER (preview of the generated talking-character clip) ── */}
+        <div style={{
+          position: "absolute", left: COL_X, top: BIG_Y, width: COL_W, height: BIG_H,
+          opacity: bigS, transform: `translateY(${(1 - bigS) * 24}px) scale(${0.96 + 0.04 * bigS})`, transformOrigin: "center top",
+          borderRadius: 22, overflow: "hidden",
+          background: "#0c1116", border: `1.5px solid ${TEAL_LINE}`,
+          boxShadow: `0 26px 70px rgba(0,0,0,0.55), 0 0 34px ${TEAL_DIM}`, zIndex: 12,
+        }}>
+          <Vid src={rsrc(A.videoClip)} muted loop style={mediaFill} />
+          {/* transport pill bottom-center of the large player (play/pause toggles) */}
+          <div style={{ position: "absolute", left: "50%", bottom: 16, transform: "translateX(-50%)", display: "flex", alignItems: "center", gap: 10, padding: "8px 18px", borderRadius: 999, background: "rgba(8,12,16,0.7)", border: `1px solid ${TEAL_LINE}`, backdropFilter: "blur(8px)", WebkitBackdropFilter: "blur(8px)" }}>
+            <Icon k={bigPlaying ? "pause" : "play"} s={22} c={TEAL_SOFT} />
+            <div style={{ width: 180, height: 4, borderRadius: 3, background: "rgba(255,255,255,0.15)", overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${(frame % 150) / 150 * 100}%`, background: `linear-gradient(90deg,${TEAL},${TEAL_SOFT})` }} />
             </div>
-          </NodeCard>
+          </div>
+          <div style={{ position: "absolute", left: 16, top: 14, color: "#cfeaf0", fontFamily: MONO, fontSize: 18, textShadow: "0 1px 4px rgba(0,0,0,0.85)" }}>Preview · 1080×1080</div>
         </div>
 
-        {/* VIDEO GENERATOR node */}
-        <div style={{ position: "absolute", left: 760, top: 420 }}>
-          <NodeCard x={0} y={0} w={430} appear={206} label="Video Generator · Wan 2.7" accent="#34d399" ports={["video", "image"]}>
-            <div style={{ ...mediaBox, height: 360 }}>{frame >= 206 ? <Vid src={rsrc(A.videoClip)} muted loop style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : null}</div>
-          </NodeCard>
+        {/* ── SMALLER STACKED PLAYER (the source / second clip) ── */}
+        <div style={{
+          position: "absolute", left: COL_X, top: SMALL_Y, width: SMALL_W, height: SMALL_H,
+          opacity: smallS, transform: `translateY(${(1 - smallS) * 22}px) scale(${0.96 + 0.04 * smallS})`, transformOrigin: "left top",
+          borderRadius: 16, overflow: "hidden",
+          background: "#0c1116", border: `1px solid rgba(255,255,255,0.12)`,
+          boxShadow: "0 16px 44px rgba(0,0,0,0.5)", zIndex: 11,
+        }}>
+          <img src={rsrc(A.charImg)} style={mediaFill} />
+          <div style={{ position: "absolute", left: 12, top: 10, color: "#cdd9ec", fontFamily: MONO, fontSize: 15, textShadow: "0 1px 4px rgba(0,0,0,0.85)" }}>Source</div>
+        </div>
+        {/* small label to the right of the smaller player */}
+        <div style={{ position: "absolute", left: COL_X + SMALL_W + 24, top: SMALL_Y + 18, width: COL_W - SMALL_W - 24, opacity: smallS, zIndex: 11 }}>
+          <div style={{ color: "#e6f1f4", fontFamily: FONT, fontWeight: 700, fontSize: 30 }}>Lip-sync · Wan 2.7</div>
+          <div style={{ color: "#8fa3b5", fontFamily: FONT, fontWeight: 500, fontSize: 22, marginTop: 8, lineHeight: 1.35 }}>Real audio drives the generated character on the timeline.</div>
         </div>
 
-        {/* OUTPUT (split-screen) node */}
-        <div style={{ position: "absolute", left: 1360, top: 520 }}>
-          <NodeCard x={0} y={0} w={430} appear={262} label="Split-screen edit" accent="#f59e0b" ports={["video"]}>
-            <div style={{ ...mediaBox, height: 300, display: "flex", flexDirection: "column" }}>
-              <div style={{ flex: 1, overflow: "hidden" }}>{frame >= 262 ? <Vid src={rsrc(A.realTop)} muted loop style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : null}</div>
-              <div style={{ flex: 1, overflow: "hidden" }}>{frame >= 262 ? <Vid src={rsrc(A.videoClip)} muted loop style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : null}</div>
-            </div>
-          </NodeCard>
-        </div>
+        {/* ── TIMELINE PANEL (V1 video + A1 audio waveform + scrubbing playhead) ── */}
+        <TimelinePanel x={COL_X} y={TIMELINE_Y} w={COL_W} appear={TIMELINE_AT} />
       </AbsoluteFill>
 
-      {/* orbit intro (screen space) */}
-      <OrbitIntro end={84} />
-
-      {/* spotlight palette near the image node spot (screen space, before pan) */}
-      <Spotlight x={300} y={470} appear={66} dismiss={94} highlight={1} />
-
-      {/* cursor (screen space, follows the action) */}
-      <Cursor keys={[
-        { at: 0, x: 560, y: 1180 }, { at: 70, x: 330, y: 470 }, { at: 150, x: 360, y: 800 },
-        { at: 230, x: 700, y: 560 }, { at: 300, x: 780, y: 640 }, { at: 360, x: 600, y: 720 }, { at: 452, x: 540, y: 980 },
-      ]} />
-
-      {/* ── fixed chrome ── */}
-      {/* title */}
-      <div style={{ position: "absolute", top: 60, left: 0, right: 0, textAlign: "center", opacity: titleS * titleFade, transform: `translateY(${(1 - titleS) * -16}px)`, zIndex: 30 }}>
-        <div style={{ color: "#fff", fontFamily: FONT, fontWeight: 900, fontSize: 62, textShadow: "0 0 30px rgba(96,165,250,0.5)" }}>How it&apos;s made</div>
-        <div style={{ color: "#9fb0c9", fontFamily: FONT, fontWeight: 600, fontSize: 30, marginTop: 6 }}>Real voice → AI character</div>
-      </div>
-
-      {/* minimap bottom-right */}
-      <div style={{ position: "absolute", right: 40, bottom: 60, width: 200, height: 130, borderRadius: 14, background: "rgba(13,17,25,0.8)", border: "1px solid rgba(255,255,255,0.1)", overflow: "hidden", zIndex: 40, boxShadow: "0 10px 30px rgba(0,0,0,0.5)" }}>
-        <div style={{ position: "absolute", inset: 0, backgroundImage: "radial-gradient(circle, #232d3d 1px, transparent 1px)", backgroundSize: "12px 12px" }} />
-        {[["18%", "26%", "#60a5fa"], ["18%", "62%", "#3b82f6"], ["48%", "40%", "#34d399"], ["76%", "46%", "#f59e0b"]].map((m, i) => (
-          <div key={i} style={{ position: "absolute", left: m[0] as string, top: m[1] as string, width: 22, height: 14, borderRadius: 3, background: m[2] as string, opacity: 0.8 }} />
-        ))}
-        {/* viewport rect that tracks the camera */}
-        <div style={{ position: "absolute", top: "20%", height: "56%", width: "34%", border: "1.5px solid rgba(255,255,255,0.7)", borderRadius: 3, left: interpolate(frame, [70, 300, 440], [8, 52, 30], ease) + "%" }} />
-      </div>
-
-      {/* Bob narration AUDIO — decoupled from the visual so the full clip (incl. the final word) plays */}
+      {/* Bob narration AUDIO — decoupled from the visual so the full clip (incl. final word) plays */}
       <Audio src={rsrc(A.presenter)} />
-      {/* Bob presenter PiP (glass, MUTED visual) — mounted only for his ~10s narration */}
+      {/* Bob presenter PiP (glass, MUTED visual) — the NARRATOR avatar (bottom-LEFT). Mounted for his ~10s. */}
       {frame < 305 && (
-        <div style={{ position: "absolute", bottom: 56, left: 56, width: 420, height: 420, borderRadius: 26, overflow: "hidden", opacity: pip, border: "1px solid rgba(255,255,255,0.16)", boxShadow: "0 16px 50px rgba(0,0,0,0.65)", zIndex: 50 }}>
-          <Vid src={rsrc(A.presenter)} muted loop style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        <div style={{ position: "absolute", bottom: 56, left: 56, width: 280, height: 280, borderRadius: 24, overflow: "hidden", opacity: pip, border: `1px solid ${TEAL_LINE}`, boxShadow: "0 16px 50px rgba(0,0,0,0.65)", zIndex: 50 }}>
+          <Vid src={rsrc(A.presenter)} muted loop style={mediaFill} />
         </div>
       )}
 
@@ -292,8 +271,6 @@ export const Act2NodeEditor: React.FC<{ cta?: string }> = ({ cta = 'Comment "AI"
           <div style={{ transform: `scale(${0.7 + 0.3 * ctaS})`, opacity: ctaS, color: "#fff", fontFamily: FONT, fontWeight: 900, fontSize: 88, textShadow: "0 6px 34px rgba(0,0,0,0.85)" }}>{cta}</div>
         </AbsoluteFill>
       )}
-
-      {/* music bed added in a follow-up step (sourced track) — see MUSIC_BED below */}
     </AbsoluteFill>
   );
 };
