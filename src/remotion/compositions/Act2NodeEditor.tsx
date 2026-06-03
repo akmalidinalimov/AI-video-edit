@@ -26,6 +26,7 @@ const A = {
   videoClip: "uploads/gen/reel2/turns/bottom-t1.mp4",
   zigClip: "uploads/gen/reel2/turns/bottom-t2.mp4",
   realTop: "uploads/gen/reel2/turns/top-t1.mp4",
+  realGraph: "uploads/gen/reel2/ui/real_graph_band.png", // authentic Magnific dense node-graph (cropped from the reference)
   music: "sfx/act2-bed.mp3",
 };
 const rsrc = (s: string) => (s.startsWith("http") || s.startsWith("/") || s.includes("://")) ? s : staticFile(s);
@@ -54,11 +55,11 @@ const NodeCard: React.FC<NodeProps> = ({ x, y, w, appear, label, accent, caption
     <div style={{ position: "absolute", left: x, top: y, width: w, opacity: s, transform: `translateY(${(1 - s) * 24}px) scale(${0.92 + 0.08 * s})`, transformOrigin: "center top" }}>
       <div style={{ color: "#8b9bb4", fontFamily: FONT, fontWeight: 600, fontSize: 21, marginBottom: 9, marginLeft: 4, letterSpacing: 0.2 }}>{label}</div>
       <div style={{
-        position: "relative", borderRadius: 22,
-        background: "linear-gradient(160deg, rgba(38,46,62,0.92), rgba(20,25,36,0.95))",
-        border: "1px solid rgba(255,255,255,0.10)",
-        boxShadow: `0 24px 60px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 50px -12px ${accent}55`,
-        padding: 12,
+        position: "relative", borderRadius: 16,
+        background: "#16181d",
+        border: "1px solid rgba(255,255,255,0.06)",
+        boxShadow: `0 18px 44px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.04)`,
+        padding: 10,
       }}>
         {children}
         {caption ? <div style={{ color: "#9fb0c9", fontFamily: MONO, fontSize: 17, marginTop: 9, padding: "0 4px 2px", lineHeight: 1.3 }}>{caption}</div> : null}
@@ -199,7 +200,9 @@ export const Act2NodeEditor: React.FC<{ cta?: string }> = ({ cta = 'Comment "AI"
       {/* WORLD layer (camera-transformed) */}
       <AbsoluteFill style={{ transform: `translate(${camX}px, ${camY}px) scale(${camS})`, transformOrigin: "0 0" }}>
         {/* dense-graph ghost nodes (revealed on zoom-out) */}
-        {GHOSTS.map((g, i) => <Ghost key={i} {...g} reveal={ghostReveal} />)}
+        {/* REAL Magnific dense node-graph (authentic pixels) revealed on zoom-out, behind our nodes */}
+        <img src={rsrc(A.realGraph)} style={{ position: "absolute", left: -260, top: 60, width: 2700, opacity: ghostReveal * 0.9 }} />
+        {GHOSTS.map((g, i) => <Ghost key={i} {...g} reveal={ghostReveal * 0.5} />)}
 
         {/* wires (world coords) */}
         <svg width="2200" height="1400" style={{ position: "absolute", top: 0, left: 0, overflow: "visible" }}>
