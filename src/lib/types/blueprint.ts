@@ -248,6 +248,8 @@ export interface VisualBlueprint {
     transcription: Transcription;
     syncMap: SyncMapEntry[];
     styleFingerprint: Record<string, unknown>;
+    /** the reference's measured cut rhythm — drives output B-roll cadence (Step 1) */
+    editing_rhythm?: EditingRhythm;
   };
   aroll: ARollMaterialAnalysis;
   broll: BRollMaterialAnalysis[];
