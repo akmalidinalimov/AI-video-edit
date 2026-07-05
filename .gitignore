@@ -64,3 +64,10 @@ scripts/python/models/
 .claude-flow/
 .swarm/
 .claude/
+
+# local data / large artifacts
+/.tmp/
+/Raw_videos/
+/Reference Videos/
+scripts/python/.whisper/
+__pycache__/
