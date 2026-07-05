@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "note": "Scene-KB family library (scene-kb spec §3.2). MEASUREMENTS ONLY — never footage. Families are curated (human-admitted); exemplars under exemplars/<family>/ are auto-learned gated by windowed closed-loop score ≥95 + CV/VLM agreement + (referenceHash, window) dedup.",
+  "knownDistanceThreshold": 0.12,
+  "families": [
+    {
+      "id": "two_region_split",
+      "layoutClass": "two_region_split",
+      "signature": { "regionCountRange": [2, 2], "persistentAroll": true },
+      "decodeRecipe": {
+        "extractors": ["layout-analyzer:splitScore", "layout-analyzer:face+independent-thirds", "layout-regions:vlm-bands"],
+        "thresholds": { "arollSideConfidenceMin": 0.7, "knownDistance": 0.12 }
+      },
+      "renderRecipe": {
+        "templatePath": "src/lib/pipeline/template-generator.ts",
+        "compositor": "src/lib/pipeline/plan-renderer.ts",
+        "paramMap": { "dividerFraction": "layout.dividerFraction", "arollSide": "layout.arollSide", "targetShotSec": "pacing.avgShotSec" }
+      }
+    },
+    {
+      "id": "multi_region_stack",
+      "layoutClass": "multi_region_stack",
+      "signature": { "regionCountRange": [3, 5], "persistentAroll": true },
+      "decodeRecipe": {
+        "extractors": ["layout-regions:vlm-bands", "layout-analyzer:edgeProfile-seam-snap"],
+        "thresholds": { "knownDistance": 0.12 }
+      },
+      "renderRecipe": {
+        "templatePath": "src/lib/pipeline/nregion-renderer.ts",
+        "compositor": "src/lib/pipeline/nregion-renderer.ts",
+        "paramMap": { "regions": "layout.regions", "targetShotSec": "pacing.avgShotSec", "motionMix": "motion.distribution" }
+      }
+    },
+    {
+      "id": "pip_over_fullscreen",
+      "layoutClass": "pip_over_fullscreen",
+      "signature": { "regionCountRange": [2, 3], "persistentAroll": true, "requiresFloatingPip": true },
+      "decodeRecipe": {
+        "extractors": ["layout-regions:vlm-bands", "layout-analyzer:edgeProfile-seam-snap"],
+        "thresholds": { "knownDistance": 0.12 }
+      },
+      "renderRecipe": {
+        "templatePath": "src/lib/pipeline/nregion-renderer.ts",
+        "compositor": "src/lib/pipeline/nregion-renderer.ts",
+        "paramMap": { "regions": "layout.regions", "pipCornerRadiusFrac": "layout.regions[role=aroll].cornerRadiusFrac", "targetShotSec": "pacing.avgShotSec", "motionMix": "motion.distribution" }
+      }
+    }
+  ]
+}
