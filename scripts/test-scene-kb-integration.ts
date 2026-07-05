@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildSceneMatches } from "../src/lib/knowledge/scene-kb-route";
+import { buildSceneMatches, queueNovelProposal } from "../src/lib/knowledge/scene-kb-route";
 import { FileSceneKB } from "../src/lib/knowledge/scene-kb";
 import type { ReferenceDecode, DecodedField, DecodedRegion } from "../src/lib/analysis/reference-decode";
 
@@ -56,6 +56,37 @@ const learned95 = kb.learnExemplar({ scene: sceneMatches[0].scene, closedLoopSco
 ok("verify-output guard: score 95 admits", learned95.learned, learned95);
 const rematch = kb.matchScene(sceneMatches[0].scene);
 ok("after learning, the same reference scene is KNOWN", rematch.kind === "known", rematch.kind);
+
+// Test: novel scenes are queued for human review (dedup proven)
+const novelScene: DecodedScene = {
+  window: { t0: 10, t1: 12 },
+  layoutClass: "novel_family_never_seen",
+  regions: SPLIT_REGIONS,
+  decode: makeDecode(),
+  referenceHash: "novelRefHash",
+};
+const novelMatch = kb.matchScene(novelScene);
+ok("novel family is matched as kind: novel", novelMatch.kind === "novel", novelMatch.kind);
+
+// First run: queue the novel proposal
+const queuePath = path.join(tmp, "review-queue.json");
+const prop1 = queueNovelProposal(kb, novelScene, queuePath);
+ok("proposeFamily returns a FamilyProposal", prop1.layoutClass === "novel_family_never_seen");
+
+let existing = JSON.parse(fs.readFileSync(queuePath, "utf8"));
+ok("review-queue.json has 1 proposal after first run", existing.length === 1, existing.length);
+
+// Second run (identical): dedup prevents duplicate
+const prop2 = queueNovelProposal(kb, novelScene, queuePath);
+ok("second call also proposes (caller dedupes)", prop2.layoutClass === "novel_family_never_seen");
+
+existing = JSON.parse(fs.readFileSync(queuePath, "utf8"));
+ok("review-queue.json still has 1 proposal (dedup proven)", existing.length === 1, existing.length);
+
+// Verify the proposal has the right shape
+const proposal = existing[0];
+ok("proposal has referenceHash", proposal.referenceHash === "novelRefHash");
+ok("proposal has window", proposal.window && proposal.window.t0 === 10 && proposal.window.t1 === 12);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(fails === 0 ? "\n✅ scene-kb route-glue tests ALL PASS" : `\n❌ ${fails} FAILED`);

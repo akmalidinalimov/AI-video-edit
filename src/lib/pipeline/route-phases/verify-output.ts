@@ -10,8 +10,8 @@ import path from "path";
 import fs from "fs";
 
 import { verifyRender } from "@/lib/pipeline/render-verifier";
-import { computeFileHash } from "@/lib/analysis/analysisCache";
 import { FileSceneKB } from "@/lib/knowledge/scene-kb";
+import { queueNovelProposal } from "@/lib/knowledge/scene-kb-route";
 
 import type { PipelineCtx, SSEEvent } from "./types";
 
@@ -56,7 +56,24 @@ export async function verifyOutput(ctx: PipelineCtx): Promise<void> {
       if (ctx.sceneMatches?.length && verification.overall >= 95) {
         try {
           const kb = new FileSceneKB();
-          for (const { scene } of ctx.sceneMatches) {
+          const kbDir = path.join(process.cwd(), ".knowledge", "scene-kb");
+          const queuePath = path.join(kbDir, "review-queue.json");
+
+          for (const { scene, match } of ctx.sceneMatches) {
+            // Novel scenes: queue for human review (spec §4 learning gates)
+            if (match.kind === "novel") {
+              try {
+                queueNovelProposal(kb, scene, queuePath);
+                console.log(
+                  `[scene-kb] novel scene queued for review: ${scene.layoutClass} ` +
+                    `${scene.window.t0}-${scene.window.t1}s`
+                );
+              } catch (err) {
+                console.error("[scene-kb] Failed to queue novel proposal (non-blocking):", err);
+              }
+            }
+
+            // Known/family_new: learn exemplar (score-gated)
             const res = kb.learnExemplar({
               scene,
               closedLoopScore: verification.overall,
