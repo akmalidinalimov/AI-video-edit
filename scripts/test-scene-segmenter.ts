@@ -96,6 +96,26 @@ const ok = (n: string, c: boolean, got?: unknown) => { console.log(`${c ? "PASS"
   ok("single band ⇒ single_fullscreen", s[1].layoutClass === "single_fullscreen", s[1].layoutClass);
 }
 
+// 5. Non-aroll persistent overlays (header_title, graphic_overlay, caption_band) do NOT trigger PIP.
+//    Full-frame B-roll + persistent header_title ⇒ two_region_split, NOT pip_over_fullscreen.
+{
+  const tl: StructureWindow[] = [
+    { start: 0, end: 5, bands: [band("broll", 0, 1, false), band("header_title", 0, 0.12, true)] },
+  ];
+  const s = segmentScenes(makeDecode(5), { structureTimeline: tl });
+  ok("full-frame broll + persistent header_title ⇒ NOT pip_over_fullscreen", s[0].layoutClass !== "pip_over_fullscreen", s[0].layoutClass);
+  ok("instead classifies as two_region_split", s[0].layoutClass === "two_region_split", s[0].layoutClass);
+}
+
+// 6. BUT: aroll overlay OVER full-frame band DOES trigger PIP (the existing test case remains valid).
+{
+  const tl: StructureWindow[] = [
+    { start: 0, end: 5, bands: [band("broll", 0, 1, false), band("aroll", 0.55, 0.9, true, 0.2, 0.8)] },
+  ];
+  const s = segmentScenes(makeDecode(5), { structureTimeline: tl });
+  ok("full-frame broll + persistent aroll pip ⇒ pip_over_fullscreen", s[0].layoutClass === "pip_over_fullscreen", s[0].layoutClass);
+}
+
 // ── R1/R2/R3 GATE (cached artifacts only — no fresh Gemini) ──
 const R1 = `${process.cwd()}/public/uploads/1782174583392_target_2split.mp4`;
 const R2 = `${process.cwd()}/public/uploads/DownReels_20260701_191828.mp4`;

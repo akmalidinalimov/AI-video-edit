@@ -33,12 +33,13 @@ const isOverlayBand = (b: RegionBand, bands: RegionBand[]) =>
     (other.yEnd - other.yStart) > (b.yEnd - b.yStart) + 0.02);
 
 /** Canonical layoutClass of ONE structure window, from its band geometry (same rules as
- *  reference-decode's unifier: full-frame + floating persistent panel ⇒ PIP; band count else). */
+ *  reference-decode's unifier: full-frame + floating persistent aroll ⇒ PIP; band count else). */
 export function classifyWindowBands(bands: RegionBand[]): string {
-  const overlay = bands.find((b) => isOverlayBand(b, bands) && b.persistent);
-  if (overlay && bands.some(isFullFrameBand)) return "pip_over_fullscreen";
+  const arollOverlay = bands.find((b) => isOverlayBand(b, bands) && b.persistent && b.role === "aroll");
+  if (arollOverlay && bands.some(isFullFrameBand)) return "pip_over_fullscreen";
   const stacked = bands.filter((b) => !isOverlayBand(b, bands));
-  if (stacked.length <= 1) return bands.length > 1 ? "pip_over_fullscreen" : "single_fullscreen";
+  // Non-aroll overlays (header_title, graphic_overlay, caption_band) fall through to stacked classification.
+  if (stacked.length <= 1) return bands.length > 1 ? "two_region_split" : "single_fullscreen";
   if (stacked.length === 2) return "two_region_split";
   return "multi_region_stack";
 }
@@ -67,7 +68,7 @@ export function segmentScenes(
   const sorted = [...tl].sort((a, b) => a.start - b.start);
   // contiguity: first window starts at 0; each t0 = previous t1; last clamps/extends to dur.
   const wins: SceneWindow[] = sorted.map((w, i) => ({
-    t0: i === 0 ? 0 : 0, // placeholder, fixed in the pass below
+    t0: 0,
     t1: Math.min(w.end, dur),
     ...windowToScene(w),
   }));
