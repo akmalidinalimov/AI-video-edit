@@ -159,6 +159,8 @@ const kb = new FileSceneKB(tmp);
   ok("baseline exemplar learned at divider 0.56", baselineResult.learned, baselineResult);
 
   // Test (a): SMALL drift — divider 0.575 (1.5% shift from 0.56) should stay KNOWN (≤ 0.12)
+  // Derivation: broll.h Δ=0.015, aroll.y Δ=0.015 & h Δ=0.015; avg rectDist ≈ 0.005625;
+  // geometryDistance = 0.005625 × 7.0 = 0.039375; final = 0.5 × 0.039375 ≈ 0.0197 (well below 0.12).
   {
     const smallDrift: DecodedRegion[] = [
       { id: "broll_0", role: "broll", rect: { x: 0, y: 0, w: 1, h: 0.575 }, shape: "rectangle", zIndex: 0, persistent: false },
@@ -174,11 +176,13 @@ const kb = new FileSceneKB(tmp);
       { kind: m.kind, distance: m.distance });
   }
 
-  // Test (b): MODERATE drift — divider 0.66 (10% shift from 0.56) should be family_new (> 0.12)
+  // Test (b): MODERATE drift — divider 0.74 (18% shift from 0.56) should be family_new (> 0.12)
+  // Derivation: both broll.h and aroll.h shift by 0.18; rectDist ≈ (0.045 + 0.09)/2 = 0.0675;
+  // geometryDistance = 0.0675 × 7.0 = 0.4725; final = 0.5 × 0.4725 ≈ 0.2363 (well above 0.12).
   {
     const modDrift: DecodedRegion[] = [
-      { id: "broll_0", role: "broll", rect: { x: 0, y: 0, w: 1, h: 0.66 }, shape: "rectangle", zIndex: 0, persistent: false },
-      { id: "aroll_1", role: "aroll", rect: { x: 0, y: 0.66, w: 1, h: 0.34 }, shape: "rectangle", zIndex: 0, persistent: true },
+      { id: "broll_0", role: "broll", rect: { x: 0, y: 0, w: 1, h: 0.74 }, shape: "rectangle", zIndex: 0, persistent: false },
+      { id: "aroll_1", role: "aroll", rect: { x: 0, y: 0.74, w: 1, h: 0.26 }, shape: "rectangle", zIndex: 0, persistent: true },
     ];
     const modScene = makeScene({
       regions: modDrift,
@@ -186,7 +190,7 @@ const kb = new FileSceneKB(tmp);
       referenceHash: "hashModDrift",
     });
     const m = kb.matchScene(modScene);
-    ok("moderate drift (10% rect shift) ⇒ family_new (distance > 0.12)", m.kind === "family_new" && m.distance > KNOWN_DISTANCE,
+    ok("moderate drift (18% rect shift) ⇒ family_new (distance > 0.12)", m.kind === "family_new" && m.distance > KNOWN_DISTANCE,
       { kind: m.kind, distance: m.distance });
   }
 }
