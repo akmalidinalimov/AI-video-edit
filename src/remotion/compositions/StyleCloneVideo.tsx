@@ -15,10 +15,10 @@ import { CaptionRenderer } from "../components/CaptionRenderer";
 import { TextOverlayRenderer } from "../components/TextOverlayRenderer";
 import { VDIM } from "../utils/vdim";
 
-export interface StyleCloneVideoProps {
+export type StyleCloneVideoProps = {
   timeline: TimelineDefinition;
   renderConfig: RenderConfig;
-}
+};
 
 /**
  * Use <Video> during server-side rendering to avoid compositor memory issues

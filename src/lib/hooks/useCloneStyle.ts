@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef } from "react";
+import type { StyleProfile } from "@/lib/style-profile/style-profile";
 
 export type ClonePhase =
   | "idle"
@@ -17,6 +18,8 @@ export interface CloneProgress {
   progress: number; // 0-100
   message: string;
   downloadUrl?: string;
+  /** B1: decoded content-free StyleProfile 2.0 (shadow output, validation surface). */
+  styleProfile?: StyleProfile;
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -46,8 +49,8 @@ export function useCloneStyle() {
   const start = useCallback(
     async (files: {
       reference: File;
-      aroll: File;
-      broll: File;
+      aroll: File[];
+      broll: File[];
     }) => {
       // Abort any existing run
       abortRef.current?.abort();
@@ -82,20 +85,26 @@ export function useCloneStyle() {
         };
 
         const refPath = await uploadFile(files.reference, "reference");
-        setProgress({
-          phase: "uploading",
-          progress: 7,
-          message: "Uploading A-roll...",
-        });
 
-        const arollPath = await uploadFile(files.aroll, "A-roll");
-        setProgress({
-          phase: "uploading",
-          progress: 9,
-          message: "Uploading B-roll...",
-        });
+        const arollPaths: string[] = [];
+        for (let i = 0; i < files.aroll.length; i++) {
+          setProgress({
+            phase: "uploading",
+            progress: 6 + i,
+            message: `Uploading A-roll ${i + 1}/${files.aroll.length}...`,
+          });
+          arollPaths.push(await uploadFile(files.aroll[i], `A-roll ${i + 1}`));
+        }
 
-        const brollPath = await uploadFile(files.broll, "B-roll");
+        const brollPaths: string[] = [];
+        for (let i = 0; i < files.broll.length; i++) {
+          setProgress({
+            phase: "uploading",
+            progress: 8 + i,
+            message: `Uploading B-roll ${i + 1}/${files.broll.length}...`,
+          });
+          brollPaths.push(await uploadFile(files.broll[i], `B-roll ${i + 1}`));
+        }
 
         // ── Step 2: Start clone-style pipeline (SSE) ──
         setProgress({
@@ -109,8 +118,8 @@ export function useCloneStyle() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             referenceVideo: refPath,
-            arollVideo: arollPath,
-            brollVideo: brollPath,
+            arollVideos: arollPaths,
+            brollVideos: brollPaths,
           }),
           signal: controller.signal,
         });
@@ -157,6 +166,7 @@ export function useCloneStyle() {
                   progress: 100,
                   message: event.message || "Done!",
                   downloadUrl: event.downloadUrl,
+                  styleProfile: event.styleProfile,
                 });
                 return;
               }

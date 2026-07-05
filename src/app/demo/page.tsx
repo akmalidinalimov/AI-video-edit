@@ -4,6 +4,8 @@ import { useState, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useCloneStyle, type ClonePhase } from "@/lib/hooks/useCloneStyle";
+import { StyleCard } from "@/components/analysis/StyleCard";
+import type { StyleProfile } from "@/lib/style-profile/style-profile";
 import {
   Upload,
   Film,
@@ -235,6 +237,139 @@ function DropZone({
 }
 
 // ════════════════════════════════════════════════════════════
+// Multi Drop Zone (A-roll / B-roll — multiple files)
+// ════════════════════════════════════════════════════════════
+
+function MultiDropZone({
+  slot,
+  files,
+  onAdd,
+  onRemove,
+  disabled,
+}: {
+  slot: "aroll" | "broll";
+  files: File[];
+  onAdd: (files: File[]) => void;
+  onRemove: (index: number) => void;
+  disabled: boolean;
+}) {
+  const config = SLOT_CONFIG[slot];
+  const Icon = config.icon;
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const accept = useCallback(
+    (list: FileList | null) => {
+      if (!list || disabled) return;
+      setError(null);
+      const valid: File[] = [];
+      for (const f of Array.from(list)) {
+        const err = validateFile(f);
+        if (err) {
+          setError(err);
+          continue;
+        }
+        valid.push(f);
+      }
+      if (valid.length) onAdd(valid);
+    },
+    [disabled, onAdd]
+  );
+
+  return (
+    <div>
+      {files.length > 0 && (
+        <div className="space-y-1.5 mb-2">
+          {files.map((f, i) => (
+            <div
+              key={`${f.name}-${i}`}
+              className="flex items-center justify-between gap-2 rounded-md border bg-muted/40 px-2.5 py-1.5"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-[10px] font-medium text-muted-foreground w-4 shrink-0">
+                  {i + 1}
+                </span>
+                <CheckCircle2 className="size-3.5 text-green-500 shrink-0" />
+                <span className="text-xs truncate">{f.name}</span>
+                <span className="text-[10px] text-muted-foreground shrink-0">
+                  {(f.size / 1024 / 1024).toFixed(1)}MB
+                </span>
+              </div>
+              {!disabled && (
+                <button
+                  onClick={() => onRemove(i)}
+                  className="text-muted-foreground hover:text-foreground shrink-0"
+                  aria-label="Remove"
+                >
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div
+        className={`
+          relative flex flex-col items-center justify-center gap-1.5 p-4
+          border-2 border-dashed rounded-xl cursor-pointer transition-all duration-200
+          ${dragOver ? "border-primary bg-primary/5" : "border-muted-foreground/25 hover:border-muted-foreground/50 hover:bg-muted/50"}
+          ${disabled ? "opacity-50 pointer-events-none" : ""}
+        `}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          accept(e.dataTransfer.files);
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept=".mp4,.mov,.m4v,video/mp4,video/quicktime"
+          className="hidden"
+          onChange={(e) => {
+            accept(e.target.files);
+            e.target.value = "";
+          }}
+          disabled={disabled}
+        />
+        <div className="size-8 rounded-full bg-muted flex items-center justify-center">
+          <Icon className="size-4 text-muted-foreground" />
+        </div>
+        <div className="text-center">
+          <p className="text-sm font-medium">
+            {files.length > 0 ? `Add more ${config.label}` : config.label}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {slot === "aroll"
+              ? "Speaker clips — upload order = sequence"
+              : "Cutaways / screen recordings"}
+          </p>
+        </div>
+        <p className="text-[10px] text-muted-foreground/60">
+          Multiple — MP4 or MOV, max 500MB each
+        </p>
+      </div>
+
+      {error && (
+        <div className="flex items-center gap-1.5 mt-2 text-xs text-destructive">
+          <AlertCircle className="size-3 shrink-0" />
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
 // Progress Bar Component
 // ════════════════════════════════════════════════════════════
 
@@ -306,10 +441,12 @@ function PipelineProgress({
 function ResultView({
   downloadUrl,
   message,
+  styleProfile,
   onReset,
 }: {
   downloadUrl: string;
   message: string;
+  styleProfile?: StyleProfile;
   onReset: () => void;
 }) {
   return (
@@ -342,6 +479,9 @@ function ResultView({
       </div>
 
       <p className="text-xs text-muted-foreground text-center">{message}</p>
+
+      {/* B1 validation: the decoded content-free StyleProfile 2.0 */}
+      {styleProfile && <StyleCard profile={styleProfile} />}
     </div>
   );
 }
@@ -351,54 +491,42 @@ function ResultView({
 // ════════════════════════════════════════════════════════════
 
 export default function DemoPage() {
-  const [slots, setSlots] = useState<Record<SlotKey, VideoSlot>>({
-    reference: { file: null, preview: null },
-    aroll: { file: null, preview: null },
-    broll: { file: null, preview: null },
-  });
+  // Reference is single; A-roll and B-roll accept multiple files.
+  const [reference, setReference] = useState<VideoSlot>({ file: null, preview: null });
+  const [arolls, setArolls] = useState<File[]>([]);
+  const [brolls, setBrolls] = useState<File[]>([]);
 
   const { progress, start, cancel, reset, isRunning, isComplete, isError } =
     useCloneStyle();
 
-  const setSlotFile = useCallback((key: SlotKey, file: File) => {
-    const preview = URL.createObjectURL(file);
-    setSlots((prev) => ({
-      ...prev,
-      [key]: { file, preview },
-    }));
-  }, []);
-
-  const clearSlot = useCallback((key: SlotKey) => {
-    setSlots((prev) => {
-      if (prev[key].preview) URL.revokeObjectURL(prev[key].preview!);
-      return { ...prev, [key]: { file: null, preview: null } };
+  const setReferenceFile = useCallback((file: File) => {
+    setReference((prev) => {
+      if (prev.preview) URL.revokeObjectURL(prev.preview);
+      return { file, preview: URL.createObjectURL(file) };
     });
   }, []);
 
-  const allFilled =
-    slots.reference.file && slots.aroll.file && slots.broll.file;
+  const clearReference = useCallback(() => {
+    setReference((prev) => {
+      if (prev.preview) URL.revokeObjectURL(prev.preview);
+      return { file: null, preview: null };
+    });
+  }, []);
+
+  const allFilled = !!reference.file && arolls.length > 0 && brolls.length > 0;
 
   const handleStart = useCallback(() => {
-    if (!slots.reference.file || !slots.aroll.file || !slots.broll.file) return;
-    start({
-      reference: slots.reference.file,
-      aroll: slots.aroll.file,
-      broll: slots.broll.file,
-    });
-  }, [slots, start]);
+    if (!reference.file || arolls.length === 0 || brolls.length === 0) return;
+    start({ reference: reference.file, aroll: arolls, broll: brolls });
+  }, [reference.file, arolls, brolls, start]);
 
   const handleReset = useCallback(() => {
-    // Revoke object URLs
-    for (const key of ["reference", "aroll", "broll"] as SlotKey[]) {
-      if (slots[key].preview) URL.revokeObjectURL(slots[key].preview!);
-    }
-    setSlots({
-      reference: { file: null, preview: null },
-      aroll: { file: null, preview: null },
-      broll: { file: null, preview: null },
-    });
+    if (reference.preview) URL.revokeObjectURL(reference.preview);
+    setReference({ file: null, preview: null });
+    setArolls([]);
+    setBrolls([]);
     reset();
-  }, [slots, reset]);
+  }, [reference.preview, reset]);
 
   const showUpload = !isRunning && !isComplete;
   const showProgress = isRunning;
@@ -438,17 +566,28 @@ export default function DemoPage() {
                 </p>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                {(["reference", "aroll", "broll"] as SlotKey[]).map((key) => (
-                  <DropZone
-                    key={key}
-                    slot={key}
-                    video={slots[key]}
-                    onFile={(f) => setSlotFile(key, f)}
-                    onClear={() => clearSlot(key)}
-                    disabled={isRunning}
-                  />
-                ))}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-start">
+                <DropZone
+                  slot="reference"
+                  video={reference}
+                  onFile={setReferenceFile}
+                  onClear={clearReference}
+                  disabled={isRunning}
+                />
+                <MultiDropZone
+                  slot="aroll"
+                  files={arolls}
+                  onAdd={(fs) => setArolls((prev) => [...prev, ...fs])}
+                  onRemove={(i) => setArolls((prev) => prev.filter((_, idx) => idx !== i))}
+                  disabled={isRunning}
+                />
+                <MultiDropZone
+                  slot="broll"
+                  files={brolls}
+                  onAdd={(fs) => setBrolls((prev) => [...prev, ...fs])}
+                  onRemove={(i) => setBrolls((prev) => prev.filter((_, idx) => idx !== i))}
+                  disabled={isRunning}
+                />
               </div>
 
               <div className="flex justify-center">
@@ -541,6 +680,7 @@ export default function DemoPage() {
             <ResultView
               downloadUrl={progress.downloadUrl}
               message={progress.message}
+              styleProfile={progress.styleProfile}
               onReset={handleReset}
             />
           )}

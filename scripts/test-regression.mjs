@@ -390,6 +390,56 @@ function check_frame_aligned_enables(plan) {
   return { pass: false, details: violations.join("\n     ") };
 }
 
+// ── CHECK 14: N-region composite overlays stay inside the canvas ──
+// Context: UNIVERSAL-1 Wave 2 N-region renderer (nregion-renderer.ts). A bad
+// regionToPixels / decode rect would place a PIP overlay off-canvas (invisible
+// or clipped). The proof script writes the composite filtergraph to
+// sp-temp/nregion-filter-{r2,r3}.txt — parse every numeric overlay=X:Y.
+function check_nregion_overlay_coords() {
+  const files = fs.existsSync(path.join(ROOT, "public/exports/sp-temp"))
+    ? fs.readdirSync(path.join(ROOT, "public/exports/sp-temp")).filter(f => /^nregion-filter-.*\.txt$/.test(f))
+    : [];
+  if (files.length === 0) return { pass: true, details: "No nregion filter debug files (skipped)" };
+  const CANVAS_W = 1080, CANVAS_H = 1920;
+  const violations = [];
+  for (const f of files) {
+    const txt = fs.readFileSync(path.join(ROOT, "public/exports/sp-temp", f), "utf8");
+    for (const m of txt.matchAll(/overlay=(-?\d+):(-?\d+)/g)) {
+      const x = parseInt(m[1]), y = parseInt(m[2]);
+      if (x < 0 || y < 0 || x >= CANVAS_W || y >= CANVAS_H) {
+        violations.push(`${f}: overlay=${x}:${y} outside ${CANVAS_W}x${CANVAS_H}`);
+      }
+    }
+  }
+  return violations.length === 0
+    ? { pass: true, details: `${files.length} filter file(s), all overlay coords in-canvas` }
+    : { pass: false, details: violations.join("; ") };
+}
+
+// ── CHECK 15: N-region pixel rects have EVEN dimensions ──
+// Context: yuv420p chroma subsampling — odd feeder dims break scale/alphamerge
+// alignment. regionToPixels() must emit even w/h; the proof script dumps the
+// pixel plan to sp-temp/nregion-plan-{r2,r3}.json.
+function check_nregion_even_dims() {
+  const dir = path.join(ROOT, "public/exports/sp-temp");
+  const files = fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter(f => /^nregion-plan-.*\.json$/.test(f))
+    : [];
+  if (files.length === 0) return { pass: true, details: "No nregion plan files (skipped)" };
+  const violations = [];
+  for (const f of files) {
+    const plan = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+    for (const r of plan.regions ?? []) {
+      if ((r.rect.w % 2) !== 0 || (r.rect.h % 2) !== 0) {
+        violations.push(`${f}: region ${r.id} has odd dims ${r.rect.w}x${r.rect.h}`);
+      }
+    }
+  }
+  return violations.length === 0
+    ? { pass: true, details: `${files.length} plan file(s), all region dims even` }
+    : { pass: false, details: violations.join("; ") };
+}
+
 // ══════════════════════════════════════════════════════════════
 // LAYER 2: RENDER + VERIFICATION CHECKS (requires --full flag)
 // These render the video and verify audio/visual quality.
@@ -636,21 +686,30 @@ async function check_multiaroll_word_completeness() {
   return { pass: false, details: bad.join("\n     ") };
 }
 
-// ── CHECK MA5: Word times are MMS FORCED-ALIGNED (not raw Gemini) ──
+// ── CHECK MA5: Word times are FORCED-ALIGNED by a COMMERCIAL-SAFE aligner ──
 // Bug: Gemini word timestamps drift 300-1000ms, so trims clipped words ("kerak",
-// "Mahsulotingizni"). Fix (Phase G): MMS forced alignment gives precise per-word
-// times. Rule: clip_N_words.json must be detector:"mms" so cuts are precise.
-function check_multiaroll_mms_aligned() {
-  let any = false, violations = [];
+// "Mahsulotingizni"). Fix: forced alignment gives precise per-word times.
+// SHIP-GATE: the old rule required detector:"mms", but torchaudio MMS_FA is CC-BY-NC-4.0
+// (NON-COMMERCIAL). This gate now (a) FAILS on detector:"mms" so a non-commercial aligner
+// can never silently ship, and (b) requires a commercial-safe forced aligner (stable_ts /
+// scribe / mfa). "gemini" passthrough is commercial-safe but not aligned → soft warning.
+const COMMERCIAL_SAFE_ALIGNERS = ["stable_ts", "scribe", "mfa"];
+function check_multiaroll_word_alignment() {
+  let any = false, violations = [], warns = [];
   for (let i = 0; i < 8; i++) {
     const w = maLoad(path.join(MA_STAGE1, `clip_${i}_words.json`));
     if (!w) continue;
     any = true;
-    if (w.detector !== "mms") violations.push(`clip_${i}_words.json detector='${w.detector}' (expected 'mms' — forced alignment)`);
+    if (w.detector === "mms") {
+      violations.push(`clip_${i}_words.json detector='mms' — CC-BY-NC (NON-COMMERCIAL) aligner MUST NOT ship; use a commercial-safe aligner (stable_ts/scribe/mfa)`);
+    } else if (!COMMERCIAL_SAFE_ALIGNERS.includes(w.detector)) {
+      warns.push(`clip_${i}: detector='${w.detector}' not forced-aligned (commercial-safe but less precise)`);
+    }
   }
   if (!any) return { pass: true, details: "No multi-aroll word files (skipped)" };
-  if (violations.length === 0) return { pass: true, details: "word times forced-aligned (detector=mms)" };
-  return { pass: false, details: violations.join("\n     ") };
+  if (violations.length > 0) return { pass: false, details: violations.join("\n     ") };
+  const note = warns.length ? ` — WARN: ${warns.join("; ")}` : "";
+  return { pass: true, details: `word times commercial-safe (no MMS)${note}` };
 }
 
 // ── CHECK MA4: Crop target is HEAD-SAFE (top gap above the head) ──
@@ -740,8 +799,8 @@ async function main() {
   );
 
   record(
-    "Multi-aroll: word times forced-aligned (MMS, not raw Gemini)",
-    ...Object.values(check_multiaroll_mms_aligned())
+    "Multi-aroll: word times forced-aligned by a COMMERCIAL-SAFE aligner (no CC-BY-NC MMS)",
+    ...Object.values(check_multiaroll_word_alignment())
   );
 
   record(
@@ -752,6 +811,16 @@ async function main() {
   record(
     "Multi-aroll: crop target is head-safe (top gap)",
     ...Object.values(check_multiaroll_crop_headsafe())
+  );
+
+  record(
+    "N-region: composite overlay coords inside canvas",
+    ...Object.values(check_nregion_overlay_coords())
+  );
+
+  record(
+    "N-region: region pixel rects have even dimensions",
+    ...Object.values(check_nregion_even_dims())
   );
 
   // ── Layer 2: Full Verification ──
