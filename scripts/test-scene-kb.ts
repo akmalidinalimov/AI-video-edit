@@ -145,6 +145,95 @@ const kb = new FileSceneKB(tmp);
   ok("getRecipe on an unknown family ⇒ null", kb.getRecipe("nope") === null);
 }
 
+// 10. NEAR-BOUNDARY: calibration test — SMALL drift stays KNOWN, MODERATE drift is NOT known.
+// Exemplar has dividerFraction 0.56; test small vs moderate shifts to anchor the ×K constant.
+{
+  // Learn an exemplar at divider 0.56 (baseline)
+  const baselineScene = makeScene({ referenceHash: "hashBase" });
+  const baselineResult = kb.learnExemplar({
+    scene: baselineScene,
+    closedLoopScore: 96.5,
+    cvVlmAgree: true,
+    renderParams: { dividerFraction: 0.56 },
+  });
+  ok("baseline exemplar learned at divider 0.56", baselineResult.learned, baselineResult);
+
+  // Test (a): SMALL drift — divider 0.575 (1.5% shift from 0.56) should stay KNOWN (≤ 0.12)
+  {
+    const smallDrift: DecodedRegion[] = [
+      { id: "broll_0", role: "broll", rect: { x: 0, y: 0, w: 1, h: 0.575 }, shape: "rectangle", zIndex: 0, persistent: false },
+      { id: "aroll_1", role: "aroll", rect: { x: 0, y: 0.575, w: 1, h: 0.425 }, shape: "rectangle", zIndex: 0, persistent: true },
+    ];
+    const smallScene = makeScene({
+      regions: smallDrift,
+      decode: windowDecode(makeDecode(smallDrift, "two_region_split"), 0, 20),
+      referenceHash: "hashSmallDrift",
+    });
+    const m = kb.matchScene(smallScene);
+    ok("small drift (1.5% rect shift) ⇒ KNOWN (distance ≤ 0.12)", m.kind === "known" && m.distance <= KNOWN_DISTANCE,
+      { kind: m.kind, distance: m.distance });
+  }
+
+  // Test (b): MODERATE drift — divider 0.66 (10% shift from 0.56) should be family_new (> 0.12)
+  {
+    const modDrift: DecodedRegion[] = [
+      { id: "broll_0", role: "broll", rect: { x: 0, y: 0, w: 1, h: 0.66 }, shape: "rectangle", zIndex: 0, persistent: false },
+      { id: "aroll_1", role: "aroll", rect: { x: 0, y: 0.66, w: 1, h: 0.34 }, shape: "rectangle", zIndex: 0, persistent: true },
+    ];
+    const modScene = makeScene({
+      regions: modDrift,
+      decode: windowDecode(makeDecode(modDrift, "two_region_split"), 0, 20),
+      referenceHash: "hashModDrift",
+    });
+    const m = kb.matchScene(modScene);
+    ok("moderate drift (10% rect shift) ⇒ family_new (distance > 0.12)", m.kind === "family_new" && m.distance > KNOWN_DISTANCE,
+      { kind: m.kind, distance: m.distance });
+  }
+}
+
+// 11. COMBINED GATES: novel family that passes score+agree ⇒ rejected with novel reason.
+//     Then all gates pass ⇒ admitted; second learn of same (hash, window) ⇒ duplicate rejected.
+{
+  const novelLayout = "diagonal_sweep";
+
+  // Learn a novel-family exemplar with high score and agreement — should be REJECTED (not novel in family list).
+  {
+    const novelCandidate = kb.learnExemplar({
+      scene: makeScene({ layoutClass: novelLayout, referenceHash: "hashNovel1" }),
+      closedLoopScore: 96.0,
+      cvVlmAgree: true,
+      renderParams: { targetShotSec: 2.0 },
+    });
+    ok("novel family + high score + agree ⇒ NOT learned (novel gate override)",
+      !novelCandidate.learned && novelCandidate.reason.includes("novel"),
+      novelCandidate.reason);
+  }
+
+  // Now test all gates passing on a KNOWN family: high score, agreement, fresh (hash, window).
+  {
+    const allGates = kb.learnExemplar({
+      scene: makeScene({ referenceHash: "hashAllGates", layoutClass: "two_region_split" }),
+      closedLoopScore: 98.5,
+      cvVlmAgree: true,
+      renderParams: { targetShotSec: 2.0 },
+    });
+    ok("all gates pass ⇒ admitted (known family, score 98.5, agree, fresh hash)",
+      allGates.learned && !!allGates.exemplarId,
+      allGates);
+
+    // Second learn of the SAME (referenceHash, window) ⇒ duplicate rejected.
+    const duplicate = kb.learnExemplar({
+      scene: makeScene({ referenceHash: "hashAllGates", layoutClass: "two_region_split" }),
+      closedLoopScore: 99.0,
+      cvVlmAgree: true,
+      renderParams: { targetShotSec: 2.5 },
+    });
+    ok("same (referenceHash, window) on second learn ⇒ duplicate rejected",
+      !duplicate.learned && duplicate.reason.includes("duplicate"),
+      duplicate.reason);
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(fails === 0 ? "\n✅ scene-kb unit tests ALL PASS" : `\n❌ ${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

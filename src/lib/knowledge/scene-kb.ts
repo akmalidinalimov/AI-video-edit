@@ -121,7 +121,10 @@ function geometryDistance(a: DecodedRegion[], b: DecodedRegion[]): number {
   let sum = 0;
   for (const role of roles) {
     const ra = a.find((r) => r.role === role), rb = b.find((r) => r.role === role);
-    sum += ra && rb ? Math.min(1, rectDist(ra.rect, rb.rect) * 5.5) : 1;  // ×5.5: geometry drift sensitivity
+    // ×7.0: calibrated for KNOWN boundary at 0.12 distance. Semantic anchors:
+    // 1.5% rect drift (divider 0.56→0.575) → ≈0.053 final distance (KNOWN);
+    // 10% rect drift (divider 0.56→0.66) → ≈0.175 final distance (family_new).
+    sum += ra && rb ? Math.min(1, rectDist(ra.rect, rb.rect) * 7.0) : 1;
   }
   return sum / roles.size;
 }
