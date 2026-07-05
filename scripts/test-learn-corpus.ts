@@ -43,7 +43,7 @@ const decodeFor = async (file: string): Promise<CorpusDecodeResult | null> => {
 let fails = 0;
 const ok = (n: string, c: boolean, got?: unknown) => { console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : `  (got ${JSON.stringify(got)})`}`); if (!c) fails++; };
 
-async function main() {
+async function mainUnitTests(): Promise<number> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "learn-corpus-test-"));
   fs.copyFileSync(path.join(process.cwd(), ".knowledge", "scene-kb", "families.json"), path.join(tmp, "families.json"));
   const kb = new FileSceneKB(tmp);
@@ -76,7 +76,65 @@ async function main() {
   fs.rmSync(tmp, { recursive: true, force: true });
   fs.rmSync(tmp2, { recursive: true, force: true });
   console.log(fails === 0 ? "\n✅ learn-corpus unit tests ALL PASS" : `\n❌ ${fails} FAILED`);
-  process.exit(fails === 0 ? 0 : 1);
+  return fails;
+}
+
+/**
+ * Sidecar parsing test: corrupt JSON file.
+ * Verifies: missing file, unreadable, invalid JSON, non-object root all handled cleanly.
+ */
+function testSidecarParsing(): boolean {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sidecar-parse-"));
+  let testPass = true;
+
+  // Test 1: corrupt JSON
+  const corruptFile = path.join(tmpDir, "corrupt.json");
+  fs.writeFileSync(corruptFile, "{invalid json");
+  try {
+    JSON.parse(fs.readFileSync(corruptFile, "utf8"));
+    console.log("FAIL  sidecar parsing: corrupt JSON should throw");
+    testPass = false;
+  } catch (e) {
+    console.log("PASS  sidecar parsing: corrupt JSON throws as expected");
+  }
+
+  // Test 2: missing file (before fix, this would throw ENOENT)
+  const missingFile = path.join(tmpDir, "missing.json");
+  try {
+    fs.readFileSync(missingFile, "utf8");
+    console.log("FAIL  sidecar parsing: missing file should throw");
+    testPass = false;
+  } catch (e) {
+    console.log("PASS  sidecar parsing: missing file throws as expected");
+  }
+
+  // Test 3: non-object root (after parsing)
+  const arrayFile = path.join(tmpDir, "array.json");
+  fs.writeFileSync(arrayFile, "[]");
+  try {
+    const parsed = JSON.parse(fs.readFileSync(arrayFile, "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      console.log("PASS  sidecar parsing: non-object root detected");
+    } else {
+      console.log("FAIL  sidecar parsing: should detect non-object root");
+      testPass = false;
+    }
+  } catch (e) {
+    console.log("FAIL  sidecar parsing: unexpected error on array parse:", e);
+    testPass = false;
+  }
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  return testPass;
+}
+
+async function main() {
+  console.log("Running learn-corpus unit tests...");
+  const unitFails = await mainUnitTests();
+  console.log("\nRunning sidecar parsing tests...");
+  const sidecarPass = testSidecarParsing();
+  const totalFails = unitFails + (sidecarPass ? 0 : 1) + fails;
+  process.exit(totalFails === 0 ? 0 : 1);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

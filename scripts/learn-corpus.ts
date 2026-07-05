@@ -59,9 +59,24 @@ async function main() {
   const folder = process.argv[2];
   if (!folder || !fs.existsSync(folder)) { console.error("usage: learn-corpus <folder> [--scores scores.json]"); process.exit(1); }
   const scoresIdx = process.argv.indexOf("--scores");
-  const scores: Record<string, Record<string, number>> =
-    scoresIdx > 0 && fs.existsSync(process.argv[scoresIdx + 1])
-      ? JSON.parse(fs.readFileSync(process.argv[scoresIdx + 1], "utf8")) : {};
+  const scores: Record<string, Record<string, number>> = {};
+  if (scoresIdx > 0) {
+    const scoresPath = process.argv[scoresIdx + 1];
+    if (fs.existsSync(scoresPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(scoresPath, "utf8"));
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          console.error(`[learn-corpus] --scores sidecar unreadable or invalid JSON: ${scoresPath} (root is not a plain object) — aborting (no learning performed)`);
+          process.exit(1);
+        }
+        Object.assign(scores, parsed);
+      } catch (e) {
+        const reason = e instanceof SyntaxError ? "invalid JSON" : e instanceof Error ? e.message : "unknown error";
+        console.error(`[learn-corpus] --scores sidecar unreadable or invalid JSON: ${scoresPath} (${reason}) — aborting (no learning performed)`);
+        process.exit(1);
+      }
+    }
+  }
 
   const files = fs.readdirSync(folder)
     .filter((f) => /\.(mp4|mov)$/i.test(f))
