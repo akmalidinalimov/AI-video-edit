@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "note": "Self-learning layout archetype library (Stage 10). Each archetype has a SIGNATURE the matcher scores a measured layout against. On a confirmed analysis, recordConfirmation() appends an exemplar and re-centers the numeric ranges, so thresholds self-calibrate. Novel layouts (best matchScore < noveltyThreshold) are flagged for human confirmation per the user's 'human-confirm novel patterns' decision.",
+  "noveltyThreshold": 0.6,
+  "archetypes": [
+    {
+      "id": "split_aroll_bottom",
+      "name": "Top/bottom split — A-roll bottom, B-roll top",
+      "description": "Talking head fills the lower region; B-roll (often a ~1:1 square) sits on top. The reference reel's style.",
+      "whenToUse": "Educational/promo reels where the speaker narrates over illustrative B-roll stacked above them.",
+      "signature": {
+        "type": "split",
+        "arollSide": "bottom",
+        "shape": "rectangle",
+        "dividerRange": [0.5, 0.62],
+        "brollAspectRange": [0.85, 1.2]
+      },
+      "confirmedCount": 1,
+      "exemplars": [
+        { "dividerFraction": 0.561, "brollAspect": 1.003, "source": "1782174583392_target_2split.mp4" }
+      ]
+    },
+    {
+      "id": "split_aroll_top",
+      "name": "Top/bottom split — A-roll top, B-roll bottom",
+      "description": "Talking head fills the upper region; B-roll fills the lower region.",
+      "whenToUse": "Reaction/commentary reels where the speaker is up top and reacts to content below.",
+      "signature": {
+        "type": "split",
+        "arollSide": "top",
+        "shape": "rectangle",
+        "dividerRange": [0.38, 0.5],
+        "brollAspectRange": [0.85, 1.4]
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    },
+    {
+      "id": "circle_pip",
+      "name": "Circular PIP talking head over fullscreen B-roll",
+      "description": "Speaker's face in a small circular picture-in-picture, usually a corner, over fullscreen B-roll/screen-recording. NOTE: layout_analyzer.py does NOT yet detect circular PIP (no HoughCircles); such references are handled by cv-correction.ts / pip-locator.ts and would be measured as 'fullscreen' here. Kept for the broader system + a future circle-detection stage.",
+      "whenToUse": "Screen-recording explainers / app walkthroughs with a small face bubble.",
+      "detectedByCoreCV": false,
+      "signature": {
+        "type": "circle_pip",
+        "shape": "circle",
+        "dividerRange": null,
+        "brollAspectRange": [0.5, 0.62]
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    },
+    {
+      "id": "fullscreen_aroll",
+      "name": "Fullscreen talking head with captions",
+      "description": "Speaker fills the whole 9:16 frame; captions overlaid, no persistent B-roll region.",
+      "whenToUse": "Direct-to-camera monologue reels.",
+      "signature": {
+        "type": "fullscreen",
+        "shape": "rectangle",
+        "dividerRange": null,
+        "brollAspectRange": [0.5, 0.62]
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    },
+    {
+      "id": "broll_only",
+      "name": "B-roll only (no persistent talking head)",
+      "description": "Montage of B-roll with voiceover; no on-screen speaker region. Distinguished from fullscreen_aroll by the ABSENCE of a persistent face (the CV core emits type 'broll_only' vs 'fullscreen').",
+      "whenToUse": "VO-driven montages, product reels, b-roll-only ads.",
+      "signature": {
+        "type": "broll_only",
+        "shape": "rectangle",
+        "dividerRange": null,
+        "brollAspectRange": [0.5, 0.62]
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    },
+    {
+      "id": "multi_region_stack",
+      "name": "Multi-region vertical stack (3-5 bands)",
+      "description": "Stacked composite: header/title bar + one or more content windows (B-roll, screen-recording strip) + talking head at the bottom. Decoded by the unified path (VLM bands + CV seam-snap); the 2-region CV core misreads it as fullscreen.",
+      "whenToUse": "Grok-style explainer stacks: title + content window(s) + A-roll band.",
+      "detectedByCoreCV": false,
+      "signature": {
+        "type": "multi_region_stack",
+        "layoutClass": "multi_region_stack",
+        "bandCountRange": [3, 5],
+        "arollBandPosition": "bottom",
+        "dividerRange": null,
+        "brollAspectRange": null
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    },
+    {
+      "id": "pip_over_fullscreen",
+      "name": "PIP talking head over fullscreen background",
+      "description": "Persistent non-full-width (often rounded-rect) A-roll panel floating over a full-frame background whose content class changes over time (B-roll / diagram / screen recording). Decoded by the unified path; the 2-region CV core misreads it as split/fullscreen.",
+      "whenToUse": "Screen-recording / diagram explainers with a persistent speaker bubble.",
+      "detectedByCoreCV": false,
+      "signature": {
+        "type": "pip_over_fullscreen",
+        "layoutClass": "pip_over_fullscreen",
+        "pipWidthRange": [0.4, 0.95],
+        "requiresPersistentPip": true,
+        "dividerRange": null,
+        "brollAspectRange": null
+      },
+      "confirmedCount": 0,
+      "exemplars": []
+    }
+  ]
+}
