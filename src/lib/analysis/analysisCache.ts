@@ -16,7 +16,7 @@ const CACHE_DIR = path.join(process.cwd(), "public", "analysis", ".cache");
 
 // ── Hash computation ──
 
-function computeFileHash(filePath: string): string {
+export function computeFileHash(filePath: string): string {
   const stat = fs.statSync(filePath);
   const hash = crypto.createHash("sha256");
 
@@ -44,7 +44,9 @@ export type CacheCategory =
   | "aroll_transcription"
   | "broll_material"
   | "visual_blueprint"
-  | "style_fingerprint";
+  | "style_fingerprint"
+  | "layout_semantics"
+  | "layout_regions";
 
 function getCachePath(fileHash: string, category: CacheCategory): string {
   return path.join(CACHE_DIR, `${fileHash}-${category}.json`);
