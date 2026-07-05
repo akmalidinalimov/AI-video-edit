@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildSceneMatches, queueNovelProposal } from "../src/lib/knowledge/scene-kb-route";
 import { FileSceneKB } from "../src/lib/knowledge/scene-kb";
+import type { DecodedScene } from "../src/lib/knowledge/scene-kb";
 import type { ReferenceDecode, DecodedField, DecodedRegion } from "../src/lib/analysis/reference-decode";
 
 const F = <T>(value: T): DecodedField<T> => ({ value, source: "cv", confidence: 0.9, method: "test" });

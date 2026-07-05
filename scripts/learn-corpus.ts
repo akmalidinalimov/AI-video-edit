@@ -15,9 +15,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { analyzeLayout } from "../src/lib/analysis/layout-analyzer";
-import { getCached } from "../src/lib/analysis/analysisCache";
+import { getCached, computeFileHash } from "../src/lib/analysis/analysisCache";
 import { decodeReference } from "../src/lib/analysis/reference-decode";
 import { classesAgree } from "../src/lib/analysis/reference-decode";
 import type { RegionLayout } from "../src/lib/analysis/layout-regions";
@@ -26,19 +25,6 @@ import { runLearnCorpus, type CorpusDecodeResult } from "../src/lib/knowledge/le
 
 for (const line of (fs.existsSync(".env.local") ? fs.readFileSync(".env.local", "utf8").split("\n") : [])) {
   const m = line.match(/^([A-Z0-9_]+)=(.*)$/); if (m) process.env[m[1]] = m[2].trim();
-}
-
-/** Same recipe as analysisCache.computeFileHash (first 1MB + size + mtime), local copy. */
-function hashOf(filePath: string): string {
-  const stat = fs.statSync(filePath);
-  const h = crypto.createHash("sha256");
-  const fd = fs.openSync(filePath, "r");
-  const n = Math.min(1024 * 1024, stat.size);
-  const buf = Buffer.alloc(n);
-  fs.readSync(fd, buf, 0, n, 0);
-  fs.closeSync(fd);
-  h.update(buf); h.update(stat.size.toString()); h.update(stat.mtimeMs.toString());
-  return h.digest("hex").substring(0, 16);
 }
 
 async function decodeFor(file: string): Promise<CorpusDecodeResult | null> {
@@ -50,8 +36,12 @@ async function decodeFor(file: string): Promise<CorpusDecodeResult | null> {
   return {
     decode,
     structureTimeline: rl?.structureTimeline ?? null,
-    referenceHash: hashOf(file),
-    cvVlmAgree: !!rl && (classesAgree(layout.layout.type, rl) || decode.layout.layoutClass.uncertain !== true),
+    referenceHash: computeFileHash(file),
+    // I5: strict CV/VLM agreement gate — same predicate analyze-reference.ts uses
+    // (classesAgree alone). The prior `|| uncertain !== true` OR-clause weakened
+    // the gate by admitting cases where the VLM decode merely wasn't flagged
+    // uncertain, regardless of whether it actually agreed with the CV class.
+    cvVlmAgree: !!rl && classesAgree(layout.layout.type, rl),
   };
 }
 

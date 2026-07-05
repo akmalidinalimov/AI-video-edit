@@ -49,31 +49,36 @@ export async function verifyOutput(ctx: PipelineCtx): Promise<void> {
       console.log(`[clone-style] Verification: ${report.overallMatch}% (${report.passed ? "PASS" : "FAIL"})`);
 
       // ── scene-KB learning (spec §2 [5], §4): score-gated exemplar admission.
-      // Guard: only when scene matches exist AND the closed-loop score is ≥ 95.
-      // (verification.overall is the whole-video closed-loop score; a ≥95 whole-video
-      // pass bounds every stable-structure window — the windowed score refinement per
-      // scene comes from compareWindowedStyle when an output decode exists.)
-      if (ctx.sceneMatches?.length && verification.overall >= 95) {
+      //
+      // C3 (code review): the spec requires gating each scene on the WINDOWED
+      // closed-loop score (compareWindowedStyle(refDecode, outDecode, t0, t1))
+      // rather than the whole-video Gemini Vision score, because with multiple
+      // scenes a whole-video average can pass at ≥95 while an individual scene's
+      // window is well below that. Computing outDecode (decodeReference on the
+      // RENDERED output) requires a Gemini semantics call this phase does not
+      // currently make, and we will not add an API-cost call here to fabricate
+      // that score. Until an output decode is threaded into this phase:
+      //   - Learning is restricted to single-scene references
+      //     (ctx.sceneMatches.length === 1), where whole-video ≈ the one window,
+      //     so the existing whole-video ≥95 gate is a faithful proxy.
+      //   - Multi-scene references are NOT learned from (whole-video ≥95 does not
+      //     bound each scene's individual window score); novel-scene queueing
+      //     still runs for all scenes regardless of scene count (see below).
+      // TODO: multi-scene learning needs the windowed [D] score — wire an output
+      // decode into this phase, then gate per-scene on
+      // compareWindowedStyle(refDecode, outDecode, t0, t1).total >= 95 and store
+      // that as closedLoopScore instead of verification.overall.
+      const singleScene = ctx.sceneMatches?.length === 1;
+      if (singleScene && verification.overall >= 95) {
         try {
           const kb = new FileSceneKB();
-          const kbDir = path.join(process.cwd(), ".knowledge", "scene-kb");
-          const queuePath = path.join(kbDir, "review-queue.json");
 
-          for (const { scene, match } of ctx.sceneMatches) {
-            // Novel scenes: queue for human review (spec §4 learning gates)
-            if (match.kind === "novel") {
-              try {
-                queueNovelProposal(kb, scene, queuePath);
-                console.log(
-                  `[scene-kb] novel scene queued for review: ${scene.layoutClass} ` +
-                    `${scene.window.t0}-${scene.window.t1}s`
-                );
-              } catch (err) {
-                console.error("[scene-kb] Failed to queue novel proposal (non-blocking):", err);
-              }
-            }
+          for (const { scene, match } of ctx.sceneMatches!) {
+            // Known/family_new: learn exemplar (score-gated). Skip "novel" kinds
+            // here — they are queued for human review below, not auto-learned
+            // (matches runLearnCorpus's match.kind !== "novel" filter; I7).
+            if (match.kind === "novel") continue;
 
-            // Known/family_new: learn exemplar (score-gated)
             const res = kb.learnExemplar({
               scene,
               closedLoopScore: verification.overall,
@@ -93,7 +98,35 @@ export async function verifyOutput(ctx: PipelineCtx): Promise<void> {
           console.error("[clone-style] scene-KB learn failed (non-blocking):", err);
         }
       } else if (ctx.sceneMatches?.length) {
-        console.log(`[clone-style] Scene KB learn: gated OFF (score ${verification.overall} < 95).`);
+        console.log(
+          `[clone-style] Scene KB learn: gated OFF (` +
+            `${!singleScene ? "multi-scene reference, needs windowed score" : `score ${verification.overall} < 95`}).`
+        );
+      }
+
+      // Novel-scene queueing (spec §4): queue for human review regardless of
+      // render score — I6 fix. Learning above stays gated; queueing does not.
+      if (ctx.sceneMatches?.length) {
+        try {
+          const kb = new FileSceneKB();
+          const kbDir = path.join(process.cwd(), ".knowledge", "scene-kb");
+          const queuePath = path.join(kbDir, "review-queue.json");
+
+          for (const { scene, match } of ctx.sceneMatches) {
+            if (match.kind !== "novel") continue;
+            try {
+              queueNovelProposal(kb, scene, queuePath);
+              console.log(
+                `[scene-kb] novel scene queued for review: ${scene.layoutClass} ` +
+                  `${scene.window.t0}-${scene.window.t1}s`
+              );
+            } catch (err) {
+              console.error("[scene-kb] Failed to queue novel proposal (non-blocking):", err);
+            }
+          }
+        } catch (err) {
+          console.error("[clone-style] novel-scene queueing failed (non-blocking):", err);
+        }
       }
     } catch (err) {
       console.error("[clone-style] Verification failed (non-blocking):", err);
