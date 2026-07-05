@@ -32,6 +32,7 @@ import { combineEnableExprs } from "./editing-plan";
 import type { VCSTemplate, LayoutVariant } from "./vcs-templates";
 import { buildOverlayExpr } from "./layout-map";
 import { resolveFontForStyle, inferStyleFromHints } from "./font-registry";
+import { calculateSquareCrop, calculateBandCrop, CIRCLE_TARGET_DEFAULT } from "./square-crop";
 
 // ════════════════════════════════════════════════════════════
 // TYPES
@@ -44,6 +45,9 @@ export interface RenderInput {
   template: VCSTemplate;
   /** A-roll source video dimensions (for face-centered crop) */
   arollSourceDimensions: { width: number; height: number };
+  /** YuNet face box (fractions of source) → the face-safe 1:1 square crop
+   *  (docs/cropping-rules.md). When absent, falls back to geometric center-crop. */
+  arollFace?: { centerX: number; centerY: number; height: number; width?: number };
   /** Path to FFmpeg binary */
   ffmpegPath: string;
   /** Output video path */
@@ -306,7 +310,8 @@ function resolveFontFile(
 export function buildFilterComplex(
   plan: EditingPlan,
   template: VCSTemplate,
-  arollSourceDimensions: { width: number; height: number }
+  arollSourceDimensions: { width: number; height: number },
+  arollFace?: { centerX: number; centerY: number; height: number; width?: number }
 ): { filterComplex: string; groups: LayoutGroup[]; allBrollIsFullCanvas: boolean } {
   const { canvas, fps } = plan;
   const filters: string[] = [];
@@ -407,6 +412,10 @@ export function buildFilterComplex(
     ) {
       continue;
     }
+    // broll_only is B-roll full-screen — never overlay an A-roll. The template
+    // gives it a full-canvas A-roll region which would stretch the 1:1 square
+    // across the whole 9:16 frame and hide the B-roll. Skip it.
+    if (group.layoutId.startsWith("broll_only")) continue;
 
     if (layout.aroll.shape === "circle") {
       // Per-range branches for circles — each gets its own dimensions
@@ -507,24 +516,19 @@ export function buildFilterComplex(
       const range = ranges[i];
       const offset = range.brollOffset ?? 0;
       const rangeStart = range.timeRange.start;
-      const layout = template.layouts[range.layoutId];
-      // When the template layout says B-roll is background, always use full
-      // canvas — override coordinates from individual blueprint segments may
-      // have slightly smaller regions that leave black bars.
-      const templateBg = layout?.broll?.isBackground ?? false;
-      const overrideBg = range.layoutOverride?.broll?.isBackground;
-      const isBackground = overrideBg ?? templateBg;
-      const brollRegion = isBackground
-        ? { x: 0, y: 0, width: canvas.width, height: canvas.height }
-        : (range.layoutOverride?.broll?.region
-            ?? layout?.broll?.region
-            ?? { x: 0, y: 0, width: canvas.width, height: canvas.height });
-      const isFullCanvas = isBackground;
+      // B-roll is the BASE layer — it must ALWAYS cover the full canvas. Partial
+      // B-roll regions (per-segment blueprint boxes that don't tile the 1920
+      // canvas) leave large black bars top/bottom. The reference is always
+      // full-bleed (docs/style-cloning-principles.md), so force a full-canvas
+      // background here; the A-roll band/circle and any intentional black header
+      // draw on top of it. This kills the unintended black gaps.
+      const brollRegion = { x: 0, y: 0, width: canvas.width, height: canvas.height };
+      const isFullCanvas = true;
 
       const targetW = isFullCanvas ? canvas.width : brollRegion.width;
       const targetH = isFullCanvas ? canvas.height : brollRegion.height;
 
-      // Build the filter chain: trim → speed → setpts → scale/crop
+      // Build the filter chain: trim → speed → rebase → scale/crop → pad.
       let filterChain = `[br_r${i}_src]trim=start=${offset.toFixed(4)},`;
 
       // Improvement #5: Apply speed adjustment if B-roll is shorter than range
@@ -533,7 +537,12 @@ export function buildFilterComplex(
         filterChain += `setpts=${ptsFactor}*PTS,`;
       }
 
-      filterChain += `setpts=PTS-STARTPTS+${rangeStart.toFixed(4)},`;
+      // Rebase content to t=0; the timeline position is set by the START PAD
+      // below — NOT by a `setpts + rangeStart` shift. A setpts shift leaves the
+      // segment with no frames before rangeStart, which breaks `overlay` frame
+      // sync for later segments (esp. a 2nd B-roll source) and renders them
+      // BLACK. Padding the start with black keeps the segment continuous from 0.
+      filterChain += `setpts=PTS-STARTPTS,`;
 
       // Improvement #4: Smart region cropping — zoom into relevant region
       if (range.brollCropRegion) {
@@ -546,11 +555,19 @@ export function buildFilterComplex(
         const cropY = Math.round(zoomH * cr.y / 100);
 
         filterChain += `scale=${zoomW}:${zoomH}:force_original_aspect_ratio=increase,` +
-          `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[br_r${i}]`;
+          `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1,`;
       } else {
         filterChain += `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,` +
-          `crop=${targetW}:${targetH},setsar=1[br_r${i}]`;
+          `crop=${targetW}:${targetH},setsar=1,`;
       }
+
+      // Normalize fps, then pad: BLACK at the start up to rangeStart (continuous
+      // from t=0 → reliable overlay frame-sync), and CLONE the last frame at the
+      // end so a short clip never runs out mid-range. `enable` gates the visible
+      // window; the pads are never seen.
+      const rangeDurSec = range.timeRange.end - range.timeRange.start;
+      filterChain += `fps=${fps},tpad=start_duration=${rangeStart.toFixed(4)}:start_mode=add:` +
+        `stop_duration=${(rangeDurSec + 1).toFixed(2)}:stop_mode=clone[br_r${i}]`;
 
       filters.push(filterChain);
     }
@@ -559,15 +576,9 @@ export function buildFilterComplex(
     lastLabel = "bg_base";
     for (let i = 0; i < rangeCount; i++) {
       const range = ranges[i];
-      const layout = template.layouts[range.layoutId];
-      // Same logic as 3c: background B-roll always uses full canvas
-      const templateBg2 = layout?.broll?.isBackground ?? false;
-      const overrideBg2 = range.layoutOverride?.broll?.isBackground;
-      const isBackground2 = overrideBg2 ?? templateBg2;
-      const isFullCanvas = isBackground2;
-
-      const overlayX = isFullCanvas ? 0 : (range.layoutOverride?.broll?.region?.x ?? layout?.broll?.region?.x ?? 0);
-      const overlayY = isFullCanvas ? 0 : (range.layoutOverride?.broll?.region?.y ?? layout?.broll?.region?.y ?? 0);
+      // B-roll base layer is always full-canvas (see 3c) — overlay at origin.
+      const overlayX = 0;
+      const overlayY = 0;
 
       filters.push(
         `[${lastLabel}][br_r${i}]overlay=${overlayX}:${overlayY}:` +
@@ -611,20 +622,20 @@ export function buildFilterComplex(
 
     // 3c. Scale/crop each B-roll branch to its target region dimensions
     for (const branch of brollBranches) {
-      const r = branch.region;
+      // Full-canvas base (see 3c): never scale B-roll to a partial region.
       filters.push(
-        `[${branch.label}_src]scale=${r.width}:${r.height}:force_original_aspect_ratio=increase,` +
-          `crop=${r.width}:${r.height},setsar=1[${branch.label}]`
+        `[${branch.label}_src]scale=${canvas.width}:${canvas.height}:force_original_aspect_ratio=increase,` +
+          `crop=${canvas.width}:${canvas.height},setsar=1[${branch.label}]`
       );
     }
 
     // 3d. Overlay each B-roll branch at (region.x, region.y) with enable
     lastLabel = "bg_base";
     for (const branch of brollBranches) {
-      const r = branch.region;
+      // Full-canvas base (see 3c): overlay at origin, never a partial region.
       const enableStr = `'${branch.combinedEnable}'`;
       filters.push(
-        `[${lastLabel}][${branch.label}]overlay=${r.x}:${r.y}:` +
+        `[${lastLabel}][${branch.label}]overlay=0:0:` +
           `enable=${enableStr}[step${stepNum}]`
       );
       lastLabel = `step${stepNum}`;
@@ -670,44 +681,47 @@ export function buildFilterComplex(
       const region = branch.layout.aroll.region;
 
       if (branch.shape === "rectangle") {
-        // ── RECTANGLE: Scale to fill and crop to region ──
-        // Scale so the source fills the target region in both dimensions,
-        // then crop to the exact region size. This matches the reference
-        // more closely — the reference had tighter framing.
-        const targetW = region.width;
-        const targetH = region.height;
-        // Compute actual scaled size after fill
-        const sourceAspect = arollSourceDimensions.width / arollSourceDimensions.height;
-        const targetAspect = targetW / targetH;
-        let scaledW: number, scaledH: number;
-        if (sourceAspect > targetAspect) {
-          // Source is wider — scale by height, crop width
-          scaledH = targetH;
-          scaledW = Math.round(targetH * sourceAspect);
+        // ── RECTANGLE/STACK: face-safe crop at the MEASURED REGION aspect ──
+        // Higher-fidelity replication: the A-roll fills whatever region the REFERENCE uses
+        // (a wide band, a square, or a 9:16 portrait) — NOT a hardcoded 1:1 square. The crop
+        // matches the region's aspect (region.width/height) and scales to it WITHOUT stretch
+        // (calculateBandCrop keeps the aspect), staying face-safe (head + shoulders, headroom).
+        const rw = Math.round(region.width), rh = Math.round(region.height);
+        const aspect = rw / Math.max(1, rh);
+        (branch as Record<string, unknown>)._adjustedW = rw;
+        (branch as Record<string, unknown>)._adjustedH = rh;
+
+        if (arollFace) {
+          const bc = calculateBandCrop(
+            arollSourceDimensions.width,
+            arollSourceDimensions.height,
+            arollFace.height,
+            arollFace.centerX,
+            arollFace.centerY,
+            aspect,
+            "stack",
+            arollFace.width
+          );
+          console.log(
+            `  [crop] Rectangle A-roll: face-safe ${bc.cropW}×${bc.cropH} (AR ${aspect.toFixed(2)}) at (${bc.cropX},${bc.cropY}) → ${rw}×${rh} (measured region, no stretch)`
+          );
+          filters.push(
+            `[${branch.label}_src]crop=${bc.cropW}:${bc.cropH}:${bc.cropX}:${bc.cropY},scale=${rw}:${rh},setsar=1[${branch.label}]`
+          );
         } else {
-          // Source is taller — scale by width, crop height
-          scaledW = targetW;
-          scaledH = Math.round(targetW / sourceAspect);
+          // Fallback: center crop at the region aspect (no face data).
+          let cw = arollSourceDimensions.width, ch = Math.round(cw / aspect);
+          if (ch > arollSourceDimensions.height) { ch = arollSourceDimensions.height; cw = Math.round(ch * aspect); }
+          cw &= ~1; ch &= ~1;
+          const cropX = Math.round((arollSourceDimensions.width - cw) / 2);
+          const cropY = Math.round((arollSourceDimensions.height - ch) / 2);
+          console.log(
+            `  [crop] Rectangle A-roll: center-crop fallback (no face) ${cw}×${ch} → ${rw}×${rh}`
+          );
+          filters.push(
+            `[${branch.label}_src]crop=${cw}:${ch}:${cropX}:${cropY},scale=${rw}:${rh},setsar=1[${branch.label}]`
+          );
         }
-        scaledW = scaledW + (scaledW % 2); // ensure even
-        scaledH = scaledH + (scaledH % 2);
-
-        // Center crop
-        const cropX = Math.round((scaledW - targetW) / 2);
-        const cropY = Math.round((scaledH - targetH) / 2);
-
-        // Store adjusted dimensions on the branch for overlay positioning
-        (branch as Record<string, unknown>)._adjustedW = targetW;
-        (branch as Record<string, unknown>)._adjustedH = targetH;
-
-        console.log(
-          `  [V6] Rectangle A-roll: scale-to-fill + crop. ` +
-          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH}`
-        );
-
-        filters.push(
-          `[${branch.label}_src]scale=${scaledW}:${scaledH},crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}]`
-        );
       } else {
         // ── CIRCLE: Center-crop from 16:9 source → square → circle mask ──
         //
@@ -725,38 +739,57 @@ export function buildFilterComplex(
         (branch as Record<string, unknown>)._adjustedW = targetW;
         (branch as Record<string, unknown>)._adjustedH = targetH;
 
-        // Scale so shorter source dimension fills the target square
-        // For 16:9 source (1920×1080), height is shorter → scale by height
-        const scale = Math.max(
-          targetW / arollSourceDimensions.width,
-          targetH / arollSourceDimensions.height
-        );
-
-        let scaledW = Math.round(arollSourceDimensions.width * scale);
-        let scaledH = Math.round(arollSourceDimensions.height * scale);
-        scaledW += scaledW % 2; // ensure even
-        scaledH += scaledH % 2;
-
-        // Center crop — take the middle square from the scaled frame
-        const cropX = Math.max(0, Math.round((scaledW - targetW) / 2));
-        const cropY = Math.max(0, Math.round((scaledH - targetH) / 2));
-
         const rangeInfo = branch.rangeId ? ` (${branch.rangeId})` : "";
-        console.log(
-          `  [V4] Circle A-roll${rangeInfo}: center-crop, no zoom. ` +
-          `${arollSourceDimensions.width}×${arollSourceDimensions.height} → ` +
-          `scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH} at (${cropX},${cropY})`
-        );
 
-        // Circle: crop to square, then apply circular mask
+        // ── Face-safe 1:1 square crop (docs/cropping-rules.md) ──
+        // Crop the square around the YuNet-detected face from the source, then
+        // scale to the circle diameter. Replaces the old geometric center-crop
+        // that ignored the face and clipped heads. Falls back to center-crop if
+        // no face data is available.
+        if (arollFace) {
+          const sq = calculateSquareCrop(
+            arollSourceDimensions.width,
+            arollSourceDimensions.height,
+            arollFace.height,
+            arollFace.centerX,
+            arollFace.centerY,
+            2,
+            "circle",
+            CIRCLE_TARGET_DEFAULT,
+            arollFace.width
+          );
+          console.log(
+            `  [crop] Circle A-roll${rangeInfo}: face-safe square ${sq.cropSize}² at (${sq.cropX},${sq.cropY}) → ${targetW}×${targetH}`
+          );
+          filters.push(
+            `[${branch.label}_src]crop=${sq.cropSize}:${sq.cropSize}:${sq.cropX}:${sq.cropY},` +
+              `scale=${targetW}:${targetH},setsar=1[${branch.label}_raw]`
+          );
+        } else {
+          const scale = Math.max(
+            targetW / arollSourceDimensions.width,
+            targetH / arollSourceDimensions.height
+          );
+          let scaledW = Math.round(arollSourceDimensions.width * scale);
+          let scaledH = Math.round(arollSourceDimensions.height * scale);
+          scaledW += scaledW % 2;
+          scaledH += scaledH % 2;
+          const cropX = Math.max(0, Math.round((scaledW - targetW) / 2));
+          const cropY = Math.max(0, Math.round((scaledH - targetH) / 2));
+          console.log(
+            `  [crop] Circle A-roll${rangeInfo}: center-crop fallback (no face). ` +
+              `scale ${scaledW}×${scaledH} → crop ${targetW}×${targetH} at (${cropX},${cropY})`
+          );
+          filters.push(
+            `[${branch.label}_src]scale=${scaledW}:${scaledH},` +
+              `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}_raw]`
+          );
+        }
+
+        // Circle: apply circular mask to the cropped square
         const radius = Math.min(targetW, targetH) / 2;
         const cx = targetW / 2;
         const cy = targetH / 2;
-
-        filters.push(
-          `[${branch.label}_src]scale=${scaledW}:${scaledH},` +
-            `crop=${targetW}:${targetH}:${cropX}:${cropY},setsar=1[${branch.label}_raw]`
-        );
         filters.push(
           `[${branch.label}_raw]format=yuva420p,` +
             `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':` +
@@ -808,21 +841,22 @@ export function buildFilterComplex(
       stepNum++;
     }
 
-    // ── 5b. Rectangle A-roll ──
-    if (layout.aroll.shape === "rectangle" && layout.aroll.region.width > 0) {
+    // ── 5b. Rectangle A-roll — placed at its MEASURED region position ──
+    // broll_only has no A-roll overlay. Otherwise the A-roll (cropped to the measured region
+    // aspect above) is overlaid at the region's exact x/y; the B-roll montage fills the
+    // complementary region behind it. No forced square, no stretch.
+    if (
+      layout.aroll.shape === "rectangle" &&
+      layout.aroll.region.width > 0 &&
+      !group.layoutId.startsWith("broll_only")
+    ) {
       const region = layout.aroll.region;
       const branchLabel = `aroll_${group.layoutId}`;
-
-      // V5.1: When A-roll aspect ratio was preserved, the crop may be taller
-      // than the template region. Keep the original overlay Y (don't center)
-      // so the A-roll extends downward into the B-roll area rather than
-      // moving up into the header zone. This preserves the reference's
-      // header-to-aroll spatial relationship while showing more of the
-      // talking head's native aspect ratio.
-      const overlayY = region.y;
+      const overlayX = Math.round(region.x ?? 0);
+      const overlayY = Math.round(region.y ?? 0);
 
       filters.push(
-        `[${lastLabel}][${branchLabel}]overlay=${region.x}:${overlayY}:` +
+        `[${lastLabel}][${branchLabel}]overlay=${overlayX}:${overlayY}:` +
           `enable=${enableStr}[step${stepNum}]`
       );
       lastLabel = `step${stepNum}`;
@@ -933,11 +967,19 @@ export function buildFilterComplex(
           const cleanText = escapeDrawtext(t.text);
           if (!cleanText) continue;
 
-          // Size the font to fill the reference text box height. Headlines
-          // fill their bounding box, so box height is a more reliable size
-          // signal than the (often-underestimated) per-glyph estimate.
-          const boxFont = Math.round(t.region.height * 0.92);
-          const fontSize = Math.max(t.fontSize ?? 0, boxFont, 18);
+          // Size the font from the reference text box height — but ONLY when the
+          // box is a plausibly tight single-line glyph box. The upstream text
+          // bbox is sometimes a huge region (e.g. a full quadrant, height ~1083),
+          // and box×0.92 then yields an absurd ~996px font that fills the screen
+          // with one word ("ololo"). Ignore implausible boxes and hard-cap size.
+          const MAX_CAPTION_FONT = Math.round(canvas.height * 0.085); // ~163px ceiling
+          const plausibleBox =
+            t.region.height > 0 && t.region.height <= canvas.height * 0.16;
+          const boxFont = plausibleBox ? Math.round(t.region.height * 0.92) : 0;
+          const fontSize = Math.min(
+            Math.max(t.fontSize ?? 0, boxFont, 36),
+            MAX_CAPTION_FONT
+          );
           const fontColor = normalizeColor(t.color) ?? "0xFFFFFF";
           const isBold = (t.fontWeight ?? "").toLowerCase().includes("bold");
           // Resolve a matching local font: prefer the classified style, else
@@ -1066,7 +1108,7 @@ export function buildFilterComplex(
  * Returns everything needed to spawn FFmpeg — the caller handles execution.
  */
 export function buildRenderArgs(input: RenderInput): RenderOutput {
-  const { plan, template, arollSourceDimensions, outputPath } = input;
+  const { plan, template, arollSourceDimensions, arollFace, outputPath } = input;
 
   const encoding: EncodingOptions = {
     preset: input.encoding?.preset ?? "fast",
@@ -1079,7 +1121,8 @@ export function buildRenderArgs(input: RenderInput): RenderOutput {
   const { filterComplex, groups, allBrollIsFullCanvas } = buildFilterComplex(
     plan,
     template,
-    arollSourceDimensions
+    arollSourceDimensions,
+    arollFace
   );
 
   const filterLines = filterComplex.split(";\n");
@@ -1181,6 +1224,169 @@ export function buildRenderArgsWithScript(
   }
 
   return result;
+}
+
+// ════════════════════════════════════════════════════════════
+// B-ROLL MONTAGE (pass 1 of the two-pass render)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Build the FFmpeg args for the B-roll MONTAGE pass: render the plan's per-range
+ * B-roll shots into ONE continuous full-canvas track using PER-SEGMENT
+ * INPUT-SEEK + concat (the memory-light way to render a cut-list).
+ *
+ * Why two passes: once the plan is subdivided into a fast montage (many shots),
+ * the single-pass "black base + time-shifted overlays" approach needs either
+ * huge start-pads (OOM) or breaks overlay frame-sync. Here each shot is its own
+ * short, input-seeked decode (no split-buffering, no pads); concat stitches them.
+ * The result is fed to the main composite pass as a single full-canvas B-roll.
+ */
+/**
+ * Pick a camera motion for montage shot `i` so the OUTPUT motion distribution matches the
+ * MEASURED reference distribution (`mix`), consuming refDecode.motion instead of discarding it.
+ * Reference motions are mapped onto the montage's supported set {push_in, pull_out, static}
+ * (pan/tilt/handheld/slow_move → push_in, the reference's dominant). Deterministic, low-discrepancy
+ * (golden-ratio) index sampling → the proportions hold even for few shots. Empty mix → push_in.
+ */
+function pickMotionFromMix(i: number, mix?: Record<string, number>): "push_in" | "pull_out" | "static" {
+  if (!mix || Object.keys(mix).length === 0) return "push_in";
+  let wPush = 0, wPull = 0, wStatic = 0;
+  for (const [k, v] of Object.entries(mix)) {
+    if (k === "pull_out") wPull += v; else if (k === "static") wStatic += v; else wPush += v;
+  }
+  const tot = wPush + wPull + wStatic || 1;
+  const r = (i * 0.6180339887) % 1; // low-discrepancy
+  const cS = wStatic / tot, cP = cS + wPull / tot;
+  return r < cS ? "static" : r < cP ? "pull_out" : "push_in";
+}
+
+export function buildBrollMontageArgs(
+  plan: EditingPlan,
+  template: VCSTemplate,
+  outputPath: string,
+  opts?: { motionMix?: Record<string, number> }
+): string[] {
+  const W = plan.canvas.width;
+  const H = plan.canvas.height;
+  const fps = plan.fps;
+  const clips = plan.sources.brollClips ?? [
+    { path: plan.sources.broll, duration: 0, inputIndex: 0 },
+  ];
+  const ranges = plan.layoutRanges;
+  const inputs: string[] = [];
+  const parts: string[] = [];
+
+  for (let i = 0; i < ranges.length; i++) {
+    const r = ranges[i];
+    // Audit fix: an out-of-range brollSourceIndex used to fall back to clips[0] SILENTLY —
+    // a wrong-clip render with no signal. Keep the fallback (never break a render) but log loud.
+    const wantIdx = r.brollSourceIndex ?? 0;
+    if (wantIdx < 0 || wantIdx >= clips.length) {
+      console.warn(`[montage] range ${r.id ?? i}: brollSourceIndex ${wantIdx} out of range (0..${clips.length - 1}) — falling back to clips[0] (${clips[0].path.split(/[\\/]/).pop()})`);
+    }
+    const src = clips[wantIdx]?.path ?? clips[0].path;
+    const off = Math.max(0, r.brollOffset ?? 0);
+    const speed = r.brollSpeed && r.brollSpeed > 0 ? r.brollSpeed : 1;
+    const rangeDur = r.timeRange.end - r.timeRange.start;
+    const srcDur = rangeDur * speed + 0.3; // consume a touch extra for safety
+    // input-level seek: fast + decodes only the needed window (low memory)
+    inputs.push("-ss", off.toFixed(3), "-t", srcDur.toFixed(3), "-i", src);
+    // Render the B-roll to its VISIBLE band (the half the A-roll square does NOT
+    // cover), NOT the full 9:16 canvas. Filling a 16:9 clip into 9:16 needs a
+    // ~1.8× UPSCALE (blur) + a narrow center slice that cuts faces. The half-band
+    // is near-square, so a 16:9 source DOWNSCALES into it (sharp) and keeps more
+    // width (fewer face-cuts). The A-roll overlays the black half in pass 2.
+    const layout = template.layouts[r.layoutId] as
+      | { aroll?: { region?: { x: number; y: number; width: number; height: number }; shape?: string } }
+      | undefined;
+    const aReg = layout?.aroll;
+    // B-roll fills the COMPLEMENT of the MEASURED A-roll region (not a forced H−square band),
+    // so a reference with a 1:1-square B-roll on top gets a full square, a 9:16 B-roll gets
+    // the taller band, etc. — whatever the reference measured.
+    const aRegion = aReg?.region;
+    let bandY = 0, bandH = 0;
+    if (aRegion && aRegion.width > 0) {
+      const arollTop = aRegion.y + aRegion.height / 2 < H / 2;
+      bandY = arollTop ? Math.round(aRegion.y + aRegion.height) : 0;
+      bandH = arollTop ? (H - bandY) : Math.round(aRegion.y);
+      bandH -= bandH % 2;
+    }
+    const isFullBleed =
+      r.layoutId.startsWith("broll_only") ||
+      aReg?.shape === "circle" ||
+      !aRegion || aRegion.width === 0 || bandH <= 0;
+    // Ken-Burns camera motion (zoompan) — the reference's B-roll is push_in-DOMINANT with a
+    // little variety, so most shots slow-zoom IN (1.00→1.10), a few hold STATIC, a few zoom OUT.
+    // Distributed deterministically by shot index to roughly match the reference's motion mix
+    // (~75% push_in / ~12% static / ~13% pull_out). Comma in min()/max() escaped for the inline
+    // filtergraph.
+    const durFrames = Math.max(1, Math.round(rangeDur * fps));
+    const zoomIn = (w: number, h: number) =>
+      `zoompan=z='min(1.0+0.10*on/${durFrames}\\,1.12)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=${fps}`;
+    const zoomOut = (w: number, h: number) =>
+      `zoompan=z='max(1.12-0.10*on/${durFrames}\\,1.0)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=${fps}`;
+    // Camera motion driven by the MEASURED reference distribution (consumes refDecode.motion).
+    const motion = pickMotionFromMix(i, opts?.motionMix);
+    const buildFrame = (tw: number, th: number, padSuffix: string): string => {
+      if (motion === "static") {
+        return `scale=${tw}:${th}:force_original_aspect_ratio=increase,crop=${tw}:${th},setsar=1${padSuffix}`;
+      }
+      const zp = motion === "pull_out" ? zoomOut : zoomIn;
+      const sw = Math.round(tw * 1.12), sh = Math.round(th * 1.12);
+      return `scale=${sw}:${sh}:force_original_aspect_ratio=increase,crop=${sw}:${sh},${zp(tw, th)},setsar=1${padSuffix}`;
+    };
+    const frame = isFullBleed ? buildFrame(W, H, "") : buildFrame(W, bandH, `,pad=${W}:${H}:0:${bandY}:black`);
+    let f = `[${i}:v]`;
+    if (speed !== 1) f += `setpts=${(1 / speed).toFixed(4)}*PTS,`;
+    // Audit fix: stop_duration was a fixed 2s — a source shortfall >2s produced frozen-then-BLACK
+    // frames and shortened the concat (cumulative timeline slip). Clone-hold for the FULL range;
+    // the trim caps output exactly, so a sufficient source renders identically to before.
+    f += `${frame},fps=${fps},tpad=stop_mode=clone:stop_duration=${rangeDur.toFixed(4)},trim=duration=${rangeDur.toFixed(4)},setpts=PTS-STARTPTS,format=yuv420p[s${i}]`;
+    parts.push(f);
+  }
+  const concat =
+    ranges.map((_, i) => `[s${i}]`).join("") +
+    `concat=n=${ranges.length}:v=1:a=0[bg]`;
+  const filter = parts.join(";") + ";" + concat;
+
+  return [
+    "-y", "-loglevel", "error",
+    ...inputs,
+    "-filter_complex", filter,
+    "-map", "[bg]",
+    "-t", plan.totalDuration.toFixed(3),
+    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", String(fps),
+    outputPath,
+  ];
+}
+
+/**
+ * Transform a plan so the main composite pass uses a pre-rendered montage as a
+ * single, continuous, full-canvas B-roll background: point B-roll at the montage
+ * and clear all per-range B-roll cutting fields (so the renderer shows the
+ * montage straight through, behind the A-roll/text). The B-roll cuts are already
+ * baked into the montage.
+ */
+export function toMontageCompositePlan(
+  plan: EditingPlan,
+  montagePath: string
+): EditingPlan {
+  return {
+    ...plan,
+    sources: {
+      ...plan.sources,
+      broll: montagePath,
+      brollClips: [{ path: montagePath, duration: plan.totalDuration, inputIndex: 0 }],
+    },
+    layoutRanges: plan.layoutRanges.map((r) => ({
+      ...r,
+      brollOffset: undefined,
+      brollSourceIndex: 0,
+      brollSpeed: undefined,
+      brollCropRegion: undefined,
+      brollKeyframes: undefined,
+    })),
+  };
 }
 
 // ════════════════════════════════════════════════════════════

@@ -42,6 +42,7 @@ import {
 } from "./editing-plan";
 
 import { type LayoutMap, getArollKeyframes, classifyOverlayText } from "./layout-map";
+import { type CadencePlan, planCadence } from "./cadence-planner";
 
 // ════════════════════════════════════════════════════════════
 // TYPES FOR ANALYSIS INPUT
@@ -613,6 +614,105 @@ function matchBrollScenes(
 }
 
 /**
+ * Enforce B-roll VARIETY (user feedback: B-roll repeated after ~18s while several
+ * clips were never used). No two consecutive ranges may use the same B-roll
+ * source, and usage is spread across ALL available sources. Relevance is kept
+ * where it doesn't conflict — a range is only reassigned on a consecutive repeat
+ * or heavy over-use, choosing the least-used source that isn't the previous one.
+ */
+/**
+ * Determine which B-roll SOURCES (clips) are on-topic, per the narrative context.
+ * A scene is "relevant" if the narrative ranked it for some sentence above the
+ * floor, or its scenePhase is a real narrative phase (not "general"). A source is
+ * usable if it owns at least one relevant scene. Off-topic clips (which the
+ * narrative marks "general"/unrelated — e.g. an athlete clip, an abstract graphic,
+ * a cartoon) are excluded so the variety pass can't pull them in just because they
+ * are unused. Falls back to "all sources" when there is no narrative context.
+ */
+function computeUsableBrollSources(
+  brollScenes: BRollScene[],
+  narrativeContext?: NarrativeContext
+): Set<number> {
+  const allSources = new Set(brollScenes.map((s) => s.sourceIndex ?? 0));
+  if (!narrativeContext) return allSources;
+  const RELEVANCE_FLOOR = 55;
+  const relevantScenes = new Set<number>();
+  for (const e of narrativeContext.relevanceMap ?? []) {
+    for (const s of e.rankedScenes ?? []) {
+      if (s.relevanceScore >= RELEVANCE_FLOOR) relevantScenes.add(s.sceneIndex);
+    }
+  }
+  const scenePhases = (narrativeContext as { scenePhases?: Array<{ sceneIndex: number; phase: string }> }).scenePhases;
+  for (const sp of scenePhases ?? []) {
+    if (sp.phase && sp.phase !== "general") relevantScenes.add(sp.sceneIndex);
+  }
+  const usable = new Set<number>();
+  for (const idx of relevantScenes) {
+    const src = brollScenes[idx]?.sourceIndex;
+    if (src !== undefined) usable.add(src);
+  }
+  return usable.size > 0 ? usable : allSources;
+}
+
+/**
+ * Spread B-roll across ON-TOPIC clips only: no consecutive repeats, no clip
+ * over-used, and any range that was assigned an off-topic source is pulled back
+ * onto a usable one. `usableSources` is the relevance-filtered source allowlist.
+ */
+function enforceBrollVariety(layoutRanges: LayoutRange[], usableSources: number[]): void {
+  const allowed = usableSources.filter((s) => s >= 0);
+  if (allowed.length === 0) return;
+  if (allowed.length === 1) {
+    // Only one on-topic clip — force every range onto it.
+    for (const r of layoutRanges) {
+      if (!allowed.includes(r.brollSourceIndex ?? -1)) { r.brollSourceIndex = allowed[0]; r.brollOffset = 0; }
+    }
+    return;
+  }
+  const usage = new Map<number, number>();
+  for (const s of allowed) usage.set(s, 0);
+  // First pass: pull any range using an OFF-TOPIC source onto the least-used allowed one.
+  for (const r of layoutRanges) {
+    let s = r.brollSourceIndex ?? 0;
+    if (!usage.has(s)) {
+      let best = allowed[0], bestUse = Infinity;
+      for (const k of allowed) { const u = usage.get(k)!; if (u < bestUse) { bestUse = u; best = k; } }
+      r.brollSourceIndex = best; r.brollOffset = 0; s = best;
+    }
+    usage.set(s, (usage.get(s) ?? 0) + 1);
+  }
+  // Second pass: break consecutive repeats + over-use, swapping only among allowed.
+  const cap = Math.ceil(layoutRanges.length / allowed.length) + 1;
+  let prev = -1;
+  let swaps = 0;
+  for (const r of layoutRanges) {
+    let s = r.brollSourceIndex ?? 0;
+    const overused = (usage.get(s) ?? 0) > cap;
+    if (s === prev || overused) {
+      let best = -1;
+      let bestUse = Infinity;
+      for (const k of allowed) {
+        if (k === prev) continue;
+        const u = usage.get(k) ?? 0;
+        if (u < bestUse) { bestUse = u; best = k; }
+      }
+      if (best >= 0 && best !== s) {
+        usage.set(s, (usage.get(s) ?? 0) - 1);
+        usage.set(best, (usage.get(best) ?? 0) + 1);
+        r.brollSourceIndex = best;
+        r.brollOffset = 0; // fresh source — start of clip
+        s = best;
+        swaps++;
+      }
+    }
+    prev = s;
+  }
+  if (swaps > 0) {
+    console.log(`    B-roll variety: reassigned ${swaps} range(s) — spread across ${allowed.length} on-topic clip(s)`);
+  }
+}
+
+/**
  * Align B-roll frames to specific speech moments (Improvement #3).
  *
  * For each layout range, if the range has multiple sentences with different
@@ -931,6 +1031,12 @@ export interface PlanBuilderInput {
    * a sentence (glitch-free, since it's a reposition, not a layout-type cut).
    */
   layoutMap?: LayoutMap;
+  /**
+   * Optional: B-roll shot cadence derived from the reference's editing rhythm
+   * (cadence-planner). Drives how finely long ranges are subdivided into B-roll
+   * shots. Omit → legacy 1.5s/2.4s behavior (backward-safe).
+   */
+  cadence?: CadencePlan;
 }
 
 /**
@@ -1108,6 +1214,52 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
     last.end = Math.max(last.end, last.end + 0.5);
   }
 
+  // ── Step 4b: Subdivide long ranges into B-roll shots (PACING) ──
+  // One range per sentence cuts B-roll only ~once per sentence — far slower than
+  // a reference reel, which cuts a fast B-roll montage every ~1–2s. Subdivide
+  // each long range into ~TARGET_SHOT_SEC sub-shots that keep the SAME layout +
+  // PIP override (NO mid-sentence PIP cut — only the B-roll behind changes, which
+  // is exactly the reference's style). B-roll matching (Step 5b) then assigns a
+  // varied, relevant clip to each sub-shot (its reuse penalty drives variety).
+  // Reference-derived cadence (cadence-planner). Falls back to the legacy 1.5s/2.4s
+  // when no cadence is supplied, so a fast reel cuts faster and a calm reel holds longer.
+  const cadence = input.cadence ?? planCadence(null);
+  const TARGET_SHOT_SEC = cadence.targetShotSec; // target B-roll shot length (reference-matched)
+  {
+    const beforeCount = mergedRanges.length;
+    const subRanges: MergedRange[] = [];
+    for (const mr of mergedRanges) {
+      const dur = mr.end - mr.start;
+      // CEIL (not round) so a range meaningfully longer than one shot cuts an extra time —
+      // the reference cuts B-roll WITHIN sentences (26 shots vs ~18 sentence-ranges), so a
+      // ~1.5s range at a ~1s cadence must yield 2 B-roll shots, not 1. Gated by MIN_SUBDIVIDE
+      // so calm references (long target) still hold. Validated: matches the reference's 26 shots.
+      // round-half-up with a subdivide gate: subdivide when a range is >1.5× a shot, and round
+      // to the nearest shot count (ceil overshot the reference's shot total by ~2).
+      const nShots =
+        dur > TARGET_SHOT_SEC * 1.5
+          ? Math.max(2, Math.round(dur / TARGET_SHOT_SEC))
+          : 1;
+      if (nShots <= 1) {
+        subRanges.push(mr);
+        continue;
+      }
+      const shotDur = dur / nShots;
+      for (let k = 0; k < nShots; k++) {
+        subRanges.push({
+          ...mr, // same layoutId / blueprintSegment / sentences / tags
+          start: mr.start + k * shotDur,
+          end: k === nShots - 1 ? mr.end : mr.start + (k + 1) * shotDur,
+        });
+      }
+    }
+    mergedRanges.length = 0;
+    mergedRanges.push(...subRanges);
+    console.log(
+      `    Subdivided ${beforeCount} sentence ranges → ${mergedRanges.length} B-roll shots (~${TARGET_SHOT_SEC}s/shot)`
+    );
+  }
+
   // ── Step 5: Frame-align all boundaries ──
   console.log("\n  Step 4: Frame-aligning boundaries...");
 
@@ -1259,6 +1411,14 @@ export function buildEditingPlan(input: PlanBuilderInput): EditingPlan {
 
     if (brollDuration > 0) {
       matchBrollScenes(layoutRanges, brollScenes, brollDuration, totalDur, input.narrativeContext);
+
+      // ── B-roll VARIETY: spread across ON-TOPIC clips only ──
+      // A source is "usable" only if the narrative context found at least one
+      // on-topic scene in it; off-topic clips (cartoon, abstract graphics, the
+      // "unrelated" athlete footage) are dropped so variety can't pull them in.
+      const usableSources = computeUsableBrollSources(brollScenes, input.narrativeContext);
+      console.log(`    On-topic B-roll sources: [${[...usableSources].sort((a, b) => a - b).join(", ")}] of ${new Set(brollScenes.map((s) => s.sourceIndex ?? 0)).size} clips`);
+      enforceBrollVariety(layoutRanges, [...usableSources]);
 
       // ── Step 6c: Frame-level keyword sync (Improvement #3) ──
       console.log("\n  Step 5c: Aligning B-roll frames to speech keywords...");

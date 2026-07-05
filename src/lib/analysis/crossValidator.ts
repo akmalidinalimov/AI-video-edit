@@ -171,6 +171,7 @@ export function assembleBlueprint(input: CrossValidationInput): VisualBlueprint 
       transcription: input.videoAnalysis.transcription,
       syncMap: input.videoAnalysis.sync_map,
       styleFingerprint: input.styleFingerprint ?? {},
+      editing_rhythm: input.videoAnalysis.editing_rhythm,
     },
     aroll: input.arollAnalysis,
     broll: input.brollAnalyses,
